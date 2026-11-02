@@ -187,11 +187,18 @@ class Screen:
             | curses.BUTTON_CTRL)
         self.stdscr.keypad(True) # Handle our own escape codes for now
 
-        # The first call to getch seems to clobber the statusbar.
-        # So we make a dummy first call.
-        self.stdscr.nodelay(True)
-        self.stdscr.getch()
-        self.stdscr.nodelay(False)
+        # Finish curses' screen clear before drawing the status bar or images.
+        # A dummy getch() would also refresh, but can discard a resize event.
+        self.stdscr.refresh()
+
+    def resize(self):
+        self.get_size()
+        if self.stdscr.getmaxyx() != (self.rows, self.cols):
+            curses.resizeterm(self.rows, self.cols)
+        # getch() can otherwise do this refresh after the Kitty image is drawn,
+        # and a clear-screen sequence also deletes Kitty image placements.
+        self.stdscr.clear()
+        self.stdscr.refresh()
 
     def create_text_win(self, length, header):
         # calculate dimensions
@@ -213,12 +220,22 @@ class Screen:
         return win, pad
 
     def swallow_keys(self):
-        self.stdscr.nodelay(True)
-        k = self.stdscr.getch()
+        resized = False
         end = monotonic() + 0.1
-        while monotonic() < end:
-            self.stdscr.getch()
-        self.stdscr.nodelay(False)
+        try:
+            while True:
+                remaining = end - monotonic()
+                if remaining <= 0:
+                    break
+                self.stdscr.timeout(ceil(remaining * 1000))
+                if self.stdscr.getch() == curses.KEY_RESIZE:
+                    resized = True
+        finally:
+            self.stdscr.nodelay(False)
+        # Terminal replies can be discarded, but the main loop must redraw
+        # after a resize, including one that arrives while draining replies.
+        if resized:
+            curses.ungetch(curses.KEY_RESIZE)
 
     def clear(self):
         sys.stdout.buffer.write('\033[2J'.encode('ascii'))
@@ -727,13 +744,16 @@ class Document(fitz.Document):
             pad.refresh(j, 0, y + 3, x + 2, y + h - 2, x + w - 3)
             key = scr.stdscr.getch()
             
-            if key in keys.REFRESH:
+            if key == curses.KEY_RESIZE:
+                resize_viewer()
+                win,pad,y,x,h,w,span = init_pad(toc)
+            elif key in keys.REFRESH:
                 scr.clear()
                 scr.get_size()
                 scr.init_curses()
                 self.set_layout(self.papersize)
                 self.mark_all_pages_stale()
-                init_pad(toc)
+                win,pad,y,x,h,w,span = init_pad(toc)
             elif key in keys.QUIT:
                 clean_exit()
             elif key == 27 or key in keys.SHOW_TOC:
@@ -825,13 +845,16 @@ class Document(fitz.Document):
             pad.refresh(j, 0, y + 3, x + 2, y + h - 2, x + w - 3)
             key = scr.stdscr.getch()
             
-            if key in keys.REFRESH:
+            if key == curses.KEY_RESIZE:
+                resize_viewer()
+                win,pad,y,x,h,w,span = init_pad(meta)
+            elif key in keys.REFRESH:
                 scr.clear()
                 scr.get_size()
                 scr.init_curses()
                 self.set_layout(self.papersize)
                 self.mark_all_pages_stale()
-                init_pad(meta)
+                win,pad,y,x,h,w,span = init_pad(meta)
             elif key in keys.QUIT:
                 clean_exit()
             elif key == 27 or key in keys.SHOW_META:
@@ -924,13 +947,16 @@ class Document(fitz.Document):
             pad.refresh(j, 0, y + 3, x + 2, y + h - 2, x + w - 3)
             key = scr.stdscr.getch()
             
-            if key in keys.REFRESH:
+            if key == curses.KEY_RESIZE:
+                resize_viewer()
+                win,pad,y,x,h,w,span = init_pad(urls)
+            elif key in keys.REFRESH:
                 scr.clear()
                 scr.get_size()
                 scr.init_curses()
                 self.set_layout(self.papersize)
                 self.mark_all_pages_stale()
-                init_pad(urls)
+                win,pad,y,x,h,w,span = init_pad(urls)
             elif key in keys.QUIT:
                 clean_exit()
             elif key == 27 or key in keys.SHOW_LINKS:
@@ -1057,10 +1083,10 @@ class shortcuts:
         self.TOGGLE_TINT      = [ord('d')]
         self.SET_PAGE_LABEL   = [ord('P')]
         self.SET_PAGE_ALT     = [ord('I')]
-        self.INC_FONT         = [ord('=')]
+        self.INC_FONT         = [ord('+')]
         self.DEC_FONT         = [ord('-')]
         self.OPEN_GUI         = [ord('X')]
-        self.REFRESH          = [18, curses.KEY_RESIZE]            # CTRL-R
+        self.REFRESH          = [18]                               # CTRL-R
         self.QUIT             = [3, ord('q')]
         self.DEBUG            = [ord('D')]
 
@@ -1132,7 +1158,7 @@ def bib_from_field(field,regex):
 def bib_from_key(citekeys):
     
     field = '$key'
-    regex = '\|'.join(citekeys)
+    regex = '\\|'.join(citekeys)
     regex = '^' + regex + '$'
     return bib_from_field(field,regex)
 
@@ -1301,6 +1327,13 @@ def crop_to_selection(doc,left,right,selection):
     doc.manualcroprect = [top_pix, bottom_pix]
 
 # Viewer functions
+
+def resize_viewer():
+    scr.resize()
+    # Pixel dimensions changed; cached rasters in every buffer must
+    # be regenerated. Resizing does not require reopening the file.
+    for buffered_doc in bufs.docs:
+        buffered_doc.mark_all_pages_stale()
 
 def visual_mode(doc,bar):
     l,t,r,b = doc.page_states[doc.page].place
@@ -1521,6 +1554,8 @@ def view(file_change,doc):
             count = int(count_string)
         
         scr.stdscr.nodelay(True)
+        scr.stdscr.timeout(100)
+
         key = scr.stdscr.getch()
         while key == -1 and not file_change.is_set():
             key = scr.stdscr.getch()
@@ -1534,7 +1569,10 @@ def view(file_change,doc):
         if key == -1:
             pass
 
-        elif key in keys.REFRESH: 
+        elif key == curses.KEY_RESIZE:
+            resize_viewer()
+
+        elif key in keys.REFRESH:
             scr.clear()
             scr.get_size()
             scr.init_curses()
@@ -1855,6 +1893,6 @@ def main(args=sys.argv):
 
 if __name__ == '__main__':
     #logging.basicConfig(filename='termpdf.log',level=logging.DEBUG)
-    logging.basicConfig(filename='termpdf.log',level=logging.WARNING)
+    #logging.basicConfig(filename='termpdf.log',level=logging.WARNING)
     main()
 
