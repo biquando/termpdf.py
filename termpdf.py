@@ -27,6 +27,7 @@ Keys:
     k, up:          back [count] pages
     l, right:       forward [count] sections
     h, left:        back [count] sections
+    H/J/K/L:         pan left/down/up/right
     gg:             go to beginning of document
     G:              go to end of document
     [count]G:       go to page [count]
@@ -42,8 +43,9 @@ Keys:
     i:              invert colors
     d:              darken using TINT_COLOR
     [count]P:       Set logical page number of current page to count
-    -:              zoom out (reflowable only)
-    +:              zoom in (reflowable only)
+    -:              zoom out
+    +, =:           zoom in
+    0:              reset zoom and pan to fit the window
     ctrl-r:         refresh
     q:              quit
 """
@@ -292,6 +294,9 @@ class Document(fitz.Document):
         self.logical_pages = list(range(0 + self.first_page_offset, self.pages + self.first_page_offset))
         self.chapter = 0
         self.rotation = 0
+        self.zoom = 1.0
+        self.pan_x = 0.5
+        self.pan_y = 0.5
         self.fontsize = fontsize
         self.width = width
         self.height = height
@@ -315,6 +320,9 @@ class Document(fitz.Document):
                  'first_page_offset': self.first_page_offset,
                  'chapter': self.chapter,
                  'rotation': self.rotation,
+                 'zoom': self.zoom,
+                 'pan_x': self.pan_x,
+                 'pan_y': self.pan_y,
                  'autocrop': self.autocrop,
                  'manualcrop': self.manualcrop,
                  'manualcroprect': self.manualcroprect,
@@ -336,6 +344,8 @@ class Document(fitz.Document):
             self.page = 0
         else:
             self.page = p
+        if self.page != self.prevpage:
+            self.pan_x = self.pan_y = 0.5
         self.logicalpage = self.page_to_logical(self.page)
     
     def goto_logical_page(self, p):
@@ -533,31 +543,48 @@ class Document(fitz.Document):
     def mark_all_pages_stale(self):
         self.page_states = [ Page_State(i) for i in range(0,self.pages + 1) ]
 
+    def change_zoom(self, steps):
+        # Bound the exponent as well as the result for large numeric counts.
+        self.zoom = max(0.25, min(8.0, self.zoom * 1.25 ** max(-32, min(32, steps))))
+
+    def pan(self, dx, dy, count=1):
+        state = self.page_states[self.page]
+        width, height = state.image_size
+        self.pan_x += dx * count * max(scr.cell_width, scr.width / 10) / width
+        self.pan_y += dy * count * max(scr.cell_height, (scr.height - scr.cell_height) / 10) / height
+        self.pan_x = max(0.0, min(1.0, self.pan_x))
+        self.pan_y = max(0.0, min(1.0, self.pan_y))
+
+    def reset_view(self):
+        self.zoom = 1.0
+        self.pan_x = self.pan_y = 0.5
+
     def clear_page(self, p):
         cmd = {'a': 'd', 'd': 'a', 'i': p + 1}
         write_gr_cmd(cmd)
 
     def cells_to_pixels(self, *coords):
-        factor = self.page_states[self.page].factor
-        l,t,_,_ = self.page_states[self.page].place
+        state = self.page_states[self.page]
+        l,t,_,_ = state.place
+        ox, oy = state.origin
         pix_coords = []
         for coord in coords:
             col = coord[0]
             row = coord[1]
-            x = (col - l) * scr.cell_width / factor
-            y = (row - t) * scr.cell_height  / factor
-            pix_coords.append((x,y))
+            point = fitz.Point((col - l) * scr.cell_width + ox,
+                               (row - t) * scr.cell_height + oy) * ~state.matrix
+            pix_coords.append(tuple(point))
         return pix_coords
 
     def pixels_to_cells(self, *coords):
-        factor = self.page_states[self.page].factor
-        l,t,_,_ = self.page_states[self.page].place
+        state = self.page_states[self.page]
+        l,t,_,_ = state.place
+        ox, oy = state.origin
         cell_coords = []
         for coord in coords:
-            x = coord[0]
-            y = coord[1]
-            col = (x * factor + l * scr.cell_width) / scr.cell_width
-            row = (y * factor + t * scr.cell_height) / scr.cell_height
+            x, y = fitz.Point(coord) * state.matrix
+            col = l + (x - ox) / scr.cell_width
+            row = t + (y - oy) / scr.cell_height
             col = int(col)
             row = int(row)
             cell_coords.append((col,row))
@@ -642,34 +669,37 @@ class Document(fitz.Document):
         # calculate zoom factor
         fx = dw / pw
         fy = dh / ph
-        factor = min(fx,fy)
-        self.page_states[p].factor = factor
-    
-        # calculate zoomed dimensions
-        zw = factor * pw
-        zh = factor * ph
+        factor = min(fx,fy) * self.zoom
+        page_state.factor = factor
+        mat = fitz.Matrix(factor, factor).prerotate(self.rotation)
+        bounds = (page.bound() * mat).irect
+        zw, zh = bounds.width, bounds.height
+        page_state.image_size = (zw, zh)
 
-        # calculate place in pixels, convert to cells
-        pix_x = (dw / 2) - (zw / 2)
-        pix_y = (dh / 2) - (zh / 2)
-        l_col = int(pix_x / scr.cell_width) + 1
-        t_row = int(pix_y / scr.cell_height)
-        r_col = l_col + int(zw / scr.cell_width)
-        b_row = t_row + int(zh / scr.cell_height)
-        place = (l_col, t_row, r_col, b_row)
-        self.page_states[p].place = place
+        # Keep the viewport inside the page, centering any axis that fits.
+        vw, vh = min(dw, zw), min(dh, zh)
+        sx = max(0, min(zw - vw, round(self.pan_x * zw - vw / 2)))
+        sy = max(0, min(zh - vh, round(self.pan_y * zh - vh / 2)))
+        self.pan_x = (sx + vw / 2) / zw
+        self.pan_y = (sy + vh / 2) / zh
+        visible = fitz.Rect(bounds.x0 + sx, bounds.y0 + sy,
+                            bounds.x0 + sx + vw, bounds.y0 + sy + vh)
 
-        # move cursor to place
-        scr.set_cursor(l_col,t_row)
+        pix_x, pix_y = (dw - vw) // 2, (dh - vh) // 2
+        l_col = pix_x // scr.cell_width + 1
+        t_row = pix_y // scr.cell_height + 1
+        offset_x, offset_y = pix_x % scr.cell_width, pix_y % scr.cell_height
+        page_state.place = (l_col, t_row,
+                            l_col + ceil((offset_x + vw) / scr.cell_width) - 1,
+                            t_row + ceil((offset_y + vh) / scr.cell_height) - 1)
+        page_state.matrix = page.rotation_matrix * mat
+        page_state.origin = (visible.x0 - offset_x, visible.y0 - offset_y)
 
-        # clear previous page
-        # display image
-        cmd = {'a': 'p', 'i': p + 1, 'z': -1}
-        if page_state.stale: #or (display and not write_gr_cmd_with_response(cmd)):
-            # get zoomed and rotated pixmap
-            mat = fitz.Matrix(factor, factor)
-            mat = mat.prerotate(self.rotation)
-            pix = page.get_pixmap(matrix = mat, alpha=self.alpha)
+        render_key = (tuple(mat), tuple(visible))
+        if page_state.stale or page_state.render_key != render_key:
+            # Clip in page coordinates before rasterizing, so even at high
+            # zoom we allocate only enough pixels for the visible viewport.
+            pix = page.get_pixmap(matrix=mat, alpha=self.alpha, clip=visible * ~mat)
 
             if self.invert:
                 pix.invert_irect()
@@ -692,19 +722,25 @@ class Document(fitz.Document):
 
             # transfer the image
             write_chunked(cmd, pix.samples)
+            page_state.render_key = render_key
+            page_state.source = (max(0, int(visible.x0 - pix.x)),
+                                 max(0, int(visible.y0 - pix.y)))
+            page_state.stale = False
 
-        if display:  
+        if display:
             # clear prevpage
             self.clear_page(self.prevpage)
+            scr.set_cursor(l_col,t_row)
             # display the image
-            cmd = {'a': 'p', 'i': p + 1, 'z': -1}
+            cmd = {'a': 'p', 'i': p + 1, 'z': -1, 'C': 1,
+                   'X': offset_x, 'Y': offset_y,
+                   'x': page_state.source[0], 'y': page_state.source[1],
+                   'w': vw, 'h': vh}
             success = write_gr_cmd_with_response(cmd)
             if not success:
-                self.page_states[p].stale = True
+                page_state.stale = True
                 bar.message = 'failed to load page ' + str(p+1)
                 bar.update(self)
-
-        self.page_states[p].stale = False 
 
         scr.swallow_keys()
 
@@ -1023,9 +1059,14 @@ class Page_State:
     def __init__(self, p):
         self.number = p
         self.stale = True
-        self.factor = (1,1)
+        self.factor = 1.0
         self.place = (0,0,40,40)
         self.crop = None
+        self.matrix = fitz.Matrix(1, 1)
+        self.origin = (0, 0)
+        self.image_size = (1, 1)
+        self.render_key = None
+        self.source = (0, 0)
 
 class status_bar:
 
@@ -1041,7 +1082,7 @@ class status_bar:
     def update(self, doc):
         p = doc.page_to_logical()
         pc = doc.page_to_logical(doc.pages)
-        self.counter = '[{}/{}]'.format(p, pc)
+        self.counter = '[{}/{}] {:.0%}'.format(p, pc, doc.zoom)
         w = self.cols = scr.cols
         cm_w = len(self.cmd)
         co_w = len(self.counter)
@@ -1083,8 +1124,11 @@ class shortcuts:
         self.TOGGLE_TINT      = [ord('d')]
         self.SET_PAGE_LABEL   = [ord('P')]
         self.SET_PAGE_ALT     = [ord('I')]
-        self.INC_FONT         = [ord('+')]
-        self.DEC_FONT         = [ord('-')]
+        self.ZOOM_IN          = [ord('+'), ord('=')]
+        self.ZOOM_OUT         = [ord('-')]
+        self.RESET_VIEW       = [ord('0')]
+        self.PAN              = {ord('H'): (-1, 0), ord('J'): (0, 1),
+                                 ord('K'): (0, -1), ord('L'): (1, 0)}
         self.OPEN_GUI         = [ord('X')]
         self.REFRESH          = [18]                               # CTRL-R
         self.QUIT             = [3, ord('q')]
@@ -1309,10 +1353,10 @@ def clean_exit(message=''):
 
 def get_text_in_rows(doc,left,right, selection):
     l,t,r,b = doc.page_states[doc.page].place
-    top = (l + left,t + selection[0] - 1)
-    bottom = (l + right,t + selection[1])
+    top = (l + left,selection[0])
+    bottom = (l + right,selection[1] + 1)
     top_pix, bottom_pix = doc.cells_to_pixels(top,bottom)
-    rect = fitz.Rect(top_pix, bottom_pix)
+    rect = fitz.Rect(top_pix, bottom_pix).normalize()
     select_text = doc.get_text_in_Rect(rect)
     link = doc.make_link()
     select_text = select_text + [link]
@@ -1320,11 +1364,12 @@ def get_text_in_rows(doc,left,right, selection):
 
 def crop_to_selection(doc,left,right,selection):
     l,t,r,b = doc.page_states[doc.page].place
-    top = (l + left,t + selection[0] - 1)
-    bottom = (l + right,t + selection[1])
+    top = (l + left,selection[0])
+    bottom = (l + right,selection[1] + 1)
     top_pix, bottom_pix = doc.cells_to_pixels(top,bottom)
+    rect = fitz.Rect(top_pix, bottom_pix).normalize()
     doc.manualcrop = True
-    doc.manualcroprect = [top_pix, bottom_pix]
+    doc.manualcroprect = [tuple(rect.top_left), tuple(rect.bottom_right)]
 
 # Viewer functions
 
@@ -1642,6 +1687,11 @@ def view(file_change,doc):
             count_string = ""
             stack = [0]
 
+        elif key in keys.RESET_VIEW and not count_string:
+            doc.reset_view()
+            count_string = ""
+            stack = [0]
+
         elif key in range(48,58): #numerals
             stack = [key] + stack
             count_string = count_string + chr(key)
@@ -1655,6 +1705,11 @@ def view(file_change,doc):
             else:
                 p = count
             doc.goto_logical_page(p)
+            count_string = ""
+            stack = [0]
+
+        elif key in keys.PAN:
+            doc.pan(*keys.PAN[key], count=count)
             count_string = ""
             stack = [0]
 
@@ -1756,15 +1811,13 @@ def view(file_change,doc):
             count_string = ""
             stack = [0]
        
-        elif key in keys.INC_FONT:
-            doc.set_layout(doc.papersize - count)
-            doc.mark_all_pages_stale()
+        elif key in keys.ZOOM_IN:
+            doc.change_zoom(count)
             count_string = ""
             stack = [0]
         
-        elif key in keys.DEC_FONT:
-            doc.set_layout(doc.papersize + count)
-            doc.mark_all_pages_stale()
+        elif key in keys.ZOOM_OUT:
+            doc.change_zoom(-count)
             count_string = ""
             stack = [0]
 

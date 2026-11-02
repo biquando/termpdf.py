@@ -76,12 +76,15 @@ navigation:
     k, up:          back [count] pages
     l, right:       forward [count] sections
     h, left:        back [count] sections
+    H/J/K/L:         pan left/down/up/right
     gg:             go to beginning of document
     G:              go to end of document
     [count]G:       go to page [count]
     q:              quit
 
-Note that these take counts, so `10j` moves forward 10 pages. 
+These take counts: `10j` moves forward 10 pages, while `3L` pans right three
+steps. In dialogs and visual select mode, the existing navigation and
+selection shortcuts remain unchanged.
 
 As mentioned above, if you opened several documents at once, you can cycle through these documents by pressing `b`:
 
@@ -148,11 +151,18 @@ You can also adjust the display of the document in a variety of ways:
     a:              toggle alpha transparency
     i:              invert colors
     d:              darken using TINT_COLOR
-    -:              zoom out (reflowable only)
-    +:              zoom in (reflowable only)
+    -:              zoom out
+    +, =:           zoom in
+    H/J/K/L:         pan left/down/up/right
+    0:              reset zoom and pan to fit the window
     ctrl-r:         refresh
 
-Zooming is currently only implemented for reflowable formats, like `epub`.
+Zoom works for PDFs and reflowable formats such as EPUB, in 25% steps from
+25% to 800% of the fit-to-window size. Panning stops at the page edges. A
+standalone `0` resets the view; zeros within counts such as `10G` still work.
+The status bar shows the zoom percentage. Zoom is retained when changing
+pages, and the new page starts centered. Zoom and pan are saved with the
+document settings.
 
 Alpha transparency and autocropping will only work on some PDFs. For manual
 cropping, see the section below, on the visual select mode.
@@ -400,9 +410,8 @@ will open the document up "fresh", ignoring any saved settings.
     -   [x] manual cropping using visual select mode
     -   [ ] fit to width
     -   [ ] fit to height
-    -   [ ] arbitrary zooming 
-    -   [ ] panning
--   [x] zoom in and out for reflowable documents
+    -   [x] zoom in and out
+    -   [x] panning
 
 ## PDF Manipulation
 
