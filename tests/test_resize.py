@@ -18,34 +18,36 @@ class ResizeTests(unittest.TestCase):
         window.refresh.assert_called_once_with()
         window.getch.assert_not_called()
 
-    def test_drain_preserves_first_and_later_resize_events(self):
-        for events in ([curses.KEY_RESIZE, -1, -1],
-                       [27, ord('_'), curses.KEY_RESIZE],
-                       [curses.KEY_RESIZE, curses.KEY_RESIZE, -1]):
-            with self.subTest(events=events):
-                screen = termpdf.Screen()
-                screen.stdscr = Mock()
-                screen.stdscr.getch.side_effect = events
-                with patch.object(termpdf, 'monotonic',
-                                  side_effect=[0, .01, .02, .03, .11]), \
-                        patch.object(curses, 'ungetch') as ungetch:
-                    screen.swallow_keys()
-                ungetch.assert_called_once_with(curses.KEY_RESIZE)
-                self.assertEqual(screen.stdscr.getch.call_count, 3)
-                # Reply draining should wait for input rather than spin.
-                self.assertTrue(all(args[0] > 0 for args, _ in
-                                    screen.stdscr.timeout.call_args_list))
-                screen.stdscr.nodelay.assert_called_once_with(False)
-
-    def test_drain_discards_replies_without_inventing_resize(self):
+    def test_graphics_reply_preserves_keys_and_resize_events_in_order(self):
         screen = termpdf.Screen()
         screen.stdscr = Mock()
-        screen.stdscr.getch.side_effect = [27, ord('_'), ord('G')]
-        with patch.object(termpdf, 'monotonic',
-                          side_effect=[0, .01, .02, .03, .11]), \
-                patch.object(curses, 'ungetch') as ungetch:
-            screen.swallow_keys()
-        ungetch.assert_not_called()
+        screen.stdscr.getch.side_effect = [
+            ord('L'), curses.KEY_RESIZE, 27, ord('H'),
+            *b'\033_Gi=2;OK\033\\', *b'\033_Gi=1;OK\033\\',
+        ]
+        self.assertTrue(screen.graphics_response(1))
+        self.assertEqual([screen.getch() for _ in range(4)],
+                         [ord('L'), curses.KEY_RESIZE, 27, ord('H')])
+        screen.stdscr.timeout.assert_called_once_with(100)
+        screen.stdscr.nodelay.assert_called_once_with(False)
+
+    def test_escape_immediately_before_graphics_reply_is_preserved(self):
+        screen = termpdf.Screen()
+        screen.stdscr = Mock()
+        screen.stdscr.getch.side_effect = [27, *b'\033_Gi=1,p=1;OK\033\\', -1]
+        self.assertTrue(screen.graphics_response(1))
+        self.assertEqual(screen.getch(), 27)
+        self.assertFalse(screen.pending_keys)
+
+    def test_graphics_reply_reports_missing_image_and_has_a_timeout(self):
+        screen = termpdf.Screen()
+        screen.stdscr = Mock()
+        screen.stdscr.getch.side_effect = b'\033_Gi=1;ENOENT:image missing\033\\'
+        self.assertFalse(screen.graphics_response(1))
+        screen.stdscr.getch.side_effect = None
+        screen.stdscr.getch.return_value = -1
+        with patch.object(termpdf, 'monotonic', side_effect=[0, 0, 3]):
+            self.assertFalse(screen.graphics_response(1))
 
     def test_resize_refreshes_curses_before_next_input(self):
         for curses_size in [(24, 80), (30, 100)]:
@@ -66,7 +68,7 @@ class ResizeTests(unittest.TestCase):
 
     def test_resize_redraws_without_reopening_document(self):
         screen = Mock()
-        screen.stdscr.getch.side_effect = [curses.KEY_RESIZE, ord('q')]
+        screen.getch.side_effect = [curses.KEY_RESIZE, ord('q')]
         doc = Mock(page=0, citekey=None)
         other_doc = Mock()
         buffers = termpdf.Buffers()
@@ -95,14 +97,14 @@ class ResizeTests(unittest.TestCase):
             call.display(bar_type.return_value, 0),
         ])
         # Keep the existing low-CPU polling interval for file-change checks.
-        self.assertEqual(screen.stdscr.timeout.call_args_list,
-                         [call(100), call(100)])
+        self.assertEqual(screen.timeout.call_args_list,
+                         [call(100), call(-1), call(100), call(-1)])
 
     def test_dialogs_handle_repeated_resizes_and_use_rebuilt_pads(self):
         for method_name in ('show_toc', 'show_meta', 'show_links'):
             with self.subTest(dialog=method_name):
                 screen = Mock()
-                screen.stdscr.getch.side_effect = [
+                screen.getch.side_effect = [
                     curses.KEY_RESIZE, curses.KEY_RESIZE, 27,
                 ]
                 doc = MagicMock(page=0, papersize=3,

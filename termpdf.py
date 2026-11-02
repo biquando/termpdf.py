@@ -23,11 +23,12 @@ __url__ = "https://github.com/dsanson/termpdf.py"
 
 __viewer_shortcuts__ = """\
 Keys:
-    j, down, space: forward [count] pages
-    k, up:          back [count] pages
-    l, right:       forward [count] sections
-    h, left:        back [count] sections
-    H/J/K/L:         pan left/down/up/right
+    j, space:       forward [count] pages
+    k:              back [count] pages
+    l:              forward [count] sections
+    h:              back [count] sections
+    H/J/K/L:         hold to pan left/down/up/right
+    arrow keys:     hold to pan in that direction
     gg:             go to beginning of document
     G:              go to end of document
     [count]G:       go to page [count]
@@ -73,12 +74,16 @@ import pyperclip
 from time import sleep, monotonic
 from base64 import standard_b64encode
 from operator import attrgetter
-from collections import namedtuple
+from collections import deque, namedtuple
 from math import ceil
 from tempfile import NamedTemporaryFile
 
 
 # Class Definitions
+
+KeyEvent = namedtuple('KeyEvent', 'key code event_type modifiers')
+KEY_EVENT = -2
+FOCUS_OUT = -3
 
 class Config:
     def __init__(self):
@@ -150,6 +155,30 @@ class Screen:
         self.cell_width = 0
         self.cell_height = 0
         self.stdscr = None
+        self.pending_keys = deque()
+        self.image_owner = None
+        self.keyboard_enabled = False
+        self.keyboard_flags = 0
+        self.last_key_event = None
+        self.key_sequence = bytearray()
+        self.input_timeout = -1
+
+    def timeout(self, milliseconds):
+        self.input_timeout = milliseconds
+        self.stdscr.timeout(milliseconds)
+
+    def enable_keyboard(self):
+        if not self.keyboard_enabled:
+            # All keys, alternate/shifted keys, text, and press/release events.
+            sys.stdout.buffer.write(b'\033[>31u\033[?u\033[?1004h')
+            sys.stdout.flush()
+            self.keyboard_enabled = True
+
+    def disable_keyboard(self):
+        if self.keyboard_enabled:
+            sys.stdout.buffer.write(b'\033[?1004l\033[<u')
+            sys.stdout.flush()
+            self.keyboard_enabled = False
 
     def get_size(self):
         fd = sys.stdout
@@ -221,23 +250,153 @@ class Screen:
         
         return win, pad
 
-    def swallow_keys(self):
-        resized = False
-        end = monotonic() + 0.1
+    def raw_key(self, continuation=False):
+        if self.pending_keys:
+            return self.pending_keys.popleft()
+        if continuation:
+            self.stdscr.timeout(25)
+            try:
+                return self.stdscr.getch()
+            finally:
+                self.stdscr.timeout(self.input_timeout)
+        return self.stdscr.getch()
+
+    def decode_key(self, sequence):
+        if sequence.startswith(b'\033[?') and sequence.endswith(b'u'):
+            self.keyboard_flags = int(sequence[3:-1])
+            return None
+        if sequence == b'\033[O':
+            return FOCUS_OUT
+        if sequence == b'\033[I':
+            return None
+        final = chr(sequence[-1])
+        fields = sequence[2:-1].decode('ascii').split(';')
+        codes = fields[0].split(':')
+        code = int(codes[0] or '1')
+        modifiers = fields[1].split(':') if len(fields) > 1 else ['1']
+        mods = int(modifiers[0] or '1') - 1
+        event_type = int(modifiers[1]) if len(modifiers) > 1 else 1
+        arrows = {'A': curses.KEY_UP, 'B': curses.KEY_DOWN,
+                  'C': curses.KEY_RIGHT, 'D': curses.KEY_LEFT,
+                  'H': curses.KEY_HOME, 'F': curses.KEY_END}
+        if final in arrows:
+            key = arrows[final]
+            code = key  # CSI arrows all use parameter 1; retain the direction.
+        elif final == '~':
+            key = {2: curses.KEY_IC, 3: curses.KEY_DC,
+                   5: curses.KEY_PPAGE, 6: curses.KEY_NPAGE}.get(code, KEY_EVENT)
+        elif final == 'u':
+            key = code
+            if mods & 4 and 97 <= code <= 122:
+                key = code - 96
+            elif len(fields) > 2 and fields[2] and event_type != 3:
+                key = int(fields[2].split(':')[0])
+            elif mods & 1 and len(codes) > 1 and codes[1]:
+                key = int(codes[1])
+            elif mods & 1 and 97 <= code <= 122:
+                key = ord(chr(code).upper())
+            if key == 13:
+                key = 10
+            if key == 127:
+                key = curses.KEY_BACKSPACE
+            if code >= 57344:
+                key = KEY_EVENT
+        else:
+            return None
+        if mods & (2 | 8 | 16 | 32):
+            key = KEY_EVENT
+        self.last_key_event = KeyEvent(key, code, event_type, mods)
+        return KEY_EVENT if event_type == 3 else key
+
+    def getch(self):
+        self.last_key_event = None
+        while True:
+            key = self.raw_key(continuation=bool(self.key_sequence))
+            if key == -1:
+                if self.key_sequence == b'\033':
+                    self.key_sequence.clear()
+                    return 27
+                return -1
+            if key > 255 or key < 0:
+                return key
+            if not self.key_sequence:
+                if key != 27:
+                    return key
+                self.key_sequence.append(key)
+                continue
+            if self.key_sequence == b'\033' and key != ord('['):
+                self.pending_keys.appendleft(key)
+                self.key_sequence.clear()
+                return 27
+            self.key_sequence.append(key)
+            if len(self.key_sequence) > 2 and 0x40 <= key <= 0x7e:
+                sequence = bytes(self.key_sequence)
+                self.key_sequence.clear()
+                try:
+                    decoded = self.decode_key(sequence)
+                except (ValueError, UnicodeError):
+                    decoded = None
+                if decoded is not None:
+                    return decoded
+
+    def getstr(self):
+        # Curses' getstr would interpret the bytes of encoded key events as
+        # search text. Read decoded keys instead, including Backspace/Enter.
+        text = []
+        while True:
+            key = self.getch()
+            if key == 10:
+                return ''.join(text).encode('utf-8')
+            if key == 27:
+                return b''
+            if key == curses.KEY_RESIZE:
+                self.pending_keys.appendleft(key)
+                return b''
+            if key in (8, 127, curses.KEY_BACKSPACE):
+                if text:
+                    text.pop()
+                    sys.stdout.write('\b \b')
+                    sys.stdout.flush()
+            elif key >= 32 and (key <= 126 or
+                    (isinstance(self.last_key_event, KeyEvent) and
+                     32 <= self.last_key_event.code < 57344 and key <= 0x10ffff)):
+                text.append(chr(key))
+                sys.stdout.write(chr(key))
+                sys.stdout.flush()
+
+    def graphics_response(self, image_id):
+        """Read one Kitty reply without throwing away keys or resize events."""
+        response = bytearray()
+        deadline = monotonic() + 2
+        self.stdscr.timeout(100)
         try:
-            while True:
-                remaining = end - monotonic()
-                if remaining <= 0:
-                    break
-                self.stdscr.timeout(ceil(remaining * 1000))
-                if self.stdscr.getch() == curses.KEY_RESIZE:
-                    resized = True
+            while monotonic() < deadline:
+                key = self.stdscr.getch()
+                if key == -1:
+                    continue
+                if key > 255:
+                    self.pending_keys.append(key)
+                    continue
+                if not response and key != 27:
+                    self.pending_keys.append(key)
+                    continue
+                response.append(key)
+                if len(response) <= 3:
+                    while response and not b'\033_G'.startswith(response):
+                        self.pending_keys.append(response.pop(0))
+                    continue
+                if response.endswith(b'\033\\'):
+                    header, _, status = bytes(response[3:-2]).partition(b';')
+                    fields = dict(field.split(b'=', 1) for field in header.split(b',') if b'=' in field)
+                    if fields.get(b'i') == str(image_id).encode('ascii'):
+                        return status == b'OK'
+                    response.clear()
+            return False
         finally:
             self.stdscr.nodelay(False)
-        # Terminal replies can be discarded, but the main loop must redraw
-        # after a resize, including one that arrives while draining replies.
-        if resized:
-            curses.ungetch(curses.KEY_RESIZE)
+            # Preserve an ordinary Escape key if no graphics reply followed.
+            if len(response) < 3:
+                self.pending_keys.extend(response)
 
     def clear(self):
         sys.stdout.buffer.write('\033[2J'.encode('ascii'))
@@ -554,6 +713,10 @@ class Document(fitz.Document):
         self.pan_y += dy * count * max(scr.cell_height, (scr.height - scr.cell_height) / 10) / height
         self.pan_x = max(0.0, min(1.0, self.pan_x))
         self.pan_y = max(0.0, min(1.0, self.pan_y))
+        edge_x = min(.5, scr.width / (2 * width))
+        edge_y = min(.5, (scr.height - scr.cell_height) / (2 * height))
+        self.pan_x = max(edge_x, min(1 - edge_x, self.pan_x))
+        self.pan_y = max(edge_y, min(1 - edge_y, self.pan_y))
 
     def reset_view(self):
         self.zoom = 1.0
@@ -695,11 +858,19 @@ class Document(fitz.Document):
         page_state.matrix = page.rotation_matrix * mat
         page_state.origin = (visible.x0 - offset_x, visible.y0 - offset_y)
 
-        render_key = (tuple(mat), tuple(visible))
-        if page_state.stale or page_state.render_key != render_key:
-            # Clip in page coordinates before rasterizing, so even at high
-            # zoom we allocate only enough pixels for the visible viewport.
-            pix = page.get_pixmap(matrix=mat, alpha=self.alpha, clip=visible * ~mat)
+        page_state.viewport = visible
+        render_key = (tuple(mat), tuple(bounds), dw, dh)
+        uploaded = (page_state.stale or page_state.render_key != render_key
+                    or visible not in page_state.cache_rect)
+        if uploaded:
+            # Cache half a viewport on each side. Panning inside this area
+            # changes only Kitty's source rectangle, with at most 4x the
+            # viewport's pixel storage regardless of the zoom level.
+            cached = fitz.Rect(max(bounds.x0, visible.x0 - vw // 2),
+                               max(bounds.y0, visible.y0 - vh // 2),
+                               min(bounds.x1, visible.x1 + vw // 2),
+                               min(bounds.y1, visible.y1 + vh // 2))
+            pix = page.get_pixmap(matrix=mat, alpha=self.alpha, clip=cached * ~mat)
 
             if self.invert:
                 pix.invert_irect()
@@ -713,7 +884,7 @@ class Document(fitz.Document):
                 # tinting disabled due to unresolved bug
 
             # build cmd to send to kitty
-            cmd = {'i': p + 1, 't': 'd', 's': pix.width, 'v': pix.height}
+            cmd = {'i': p + 1, 't': 'd', 's': pix.width, 'v': pix.height, 'q': 2}
 
             if self.alpha:
                 cmd['f'] = 32
@@ -723,26 +894,38 @@ class Document(fitz.Document):
             # transfer the image
             write_chunked(cmd, pix.samples)
             page_state.render_key = render_key
-            page_state.source = (max(0, int(visible.x0 - pix.x)),
-                                 max(0, int(visible.y0 - pix.y)))
+            page_state.cache_rect = fitz.Rect(pix.irect)
             page_state.stale = False
+        page_state.source = (int(visible.x0 - page_state.cache_rect.x0),
+                             int(visible.y0 - page_state.cache_rect.y0))
 
         if display:
             # clear prevpage
-            self.clear_page(self.prevpage)
+            new_placement = scr.image_owner != (id(self), p)
+            if new_placement:
+                self.clear_page(self.prevpage)
+                scr.image_owner = (id(self), p)
             scr.set_cursor(l_col,t_row)
             # display the image
-            cmd = {'a': 'p', 'i': p + 1, 'z': -1, 'C': 1,
+            cmd = {'a': 'p', 'i': p + 1, 'p': 1, 'z': -1, 'C': 1,
                    'X': offset_x, 'Y': offset_y,
                    'x': page_state.source[0], 'y': page_state.source[1],
                    'w': vw, 'h': vh}
-            success = write_gr_cmd_with_response(cmd)
+            # Check new uploads once; cached pan frames need no round trip.
+            if uploaded or new_placement:
+                success = write_gr_cmd_with_response(cmd)
+            else:
+                cmd['q'] = 2
+                write_gr_cmd(cmd)
+                success = True
             if not success:
                 page_state.stale = True
+                if not uploaded:
+                    # Kitty may have evicted an off-screen cached image.
+                    self.display_page(bar, p, display)
+                    return
                 bar.message = 'failed to load page ' + str(p+1)
                 bar.update(self)
-
-        scr.swallow_keys()
 
     def show_toc(self, bar):
 
@@ -778,7 +961,7 @@ class Document(fitz.Document):
                 attr = curses.A_REVERSE if index == i else curses.A_NORMAL
                 pad.chgat(i, 0, span[i], attr)
             pad.refresh(j, 0, y + 3, x + 2, y + h - 2, x + w - 3)
-            key = scr.stdscr.getch()
+            key = scr.getch()
             
             if key == curses.KEY_RESIZE:
                 resize_viewer()
@@ -879,7 +1062,7 @@ class Document(fitz.Document):
                 attr = curses.A_REVERSE if index == i else curses.A_NORMAL
                 pad.chgat(i, 0, span[i], attr)
             pad.refresh(j, 0, y + 3, x + 2, y + h - 2, x + w - 3)
-            key = scr.stdscr.getch()
+            key = scr.getch()
             
             if key == curses.KEY_RESIZE:
                 resize_viewer()
@@ -981,7 +1164,7 @@ class Document(fitz.Document):
                 attr = curses.A_REVERSE if index == i else curses.A_NORMAL
                 pad.chgat(i, 0, span[i], attr)
             pad.refresh(j, 0, y + 3, x + 2, y + h - 2, x + w - 3)
-            key = scr.stdscr.getch()
+            key = scr.getch()
             
             if key == curses.KEY_RESIZE:
                 resize_viewer()
@@ -1067,6 +1250,8 @@ class Page_State:
         self.image_size = (1, 1)
         self.render_key = None
         self.source = (0, 0)
+        self.cache_rect = fitz.Rect()
+        self.viewport = fitz.Rect()
 
 class status_bar:
 
@@ -1128,7 +1313,9 @@ class shortcuts:
         self.ZOOM_OUT         = [ord('-')]
         self.RESET_VIEW       = [ord('0')]
         self.PAN              = {ord('H'): (-1, 0), ord('J'): (0, 1),
-                                 ord('K'): (0, -1), ord('L'): (1, 0)}
+                                 ord('K'): (0, -1), ord('L'): (1, 0),
+                                 curses.KEY_LEFT: (-1, 0), curses.KEY_DOWN: (0, 1),
+                                 curses.KEY_UP: (0, -1), curses.KEY_RIGHT: (1, 0)}
         self.OPEN_GUI         = [ord('X')]
         self.REFRESH          = [18]                               # CTRL-R
         self.QUIT             = [3, ord('q')]
@@ -1155,15 +1342,8 @@ def write_gr_cmd(cmd, payload=None):
     sys.stdout.flush()
 
 def write_gr_cmd_with_response(cmd, payload=None):
-    # rewrite using swallow keys to be nonblocking
     write_gr_cmd(cmd, payload)
-    resp = b''
-    while resp[-2:] != b'\033\\':
-        resp += sys.stdin.buffer.read(1)
-    if b'OK' in resp:
-        return True
-    else:
-        return False
+    return scr.graphics_response(cmd['i'])
 
 
 def write_chunked(cmd, data):
@@ -1344,6 +1524,7 @@ def clean_exit(message=''):
         doc.close()
 
     # close curses
+    scr.disable_keyboard()
     scr.stdscr.keypad(False)
     curses.echo()
     curses.curs_set(1)
@@ -1372,6 +1553,91 @@ def crop_to_selection(doc,left,right,selection):
     doc.manualcroprect = [tuple(rect.top_left), tuple(rect.bottom_right)]
 
 # Viewer functions
+
+class HeldPan:
+    def __init__(self):
+        self.keys = {}
+        self.doc = None
+        self.updated = None
+
+    @property
+    def active(self):
+        return bool(self.keys)
+
+    def press(self, doc, code, dx, dy, count=1):
+        if self.doc is not doc:
+            self.stop()
+        if not self.active:
+            self.updated = monotonic()
+        self.doc = doc
+        self.keys[code] = (dx * count, dy * count)
+
+    def release(self, code):
+        self.keys.pop(code, None)
+
+    def stop(self):
+        self.keys.clear()
+        self.updated = None
+
+    def advance(self, doc):
+        if self.doc is not doc:
+            self.stop()
+        if not self.active:
+            return
+        now = monotonic()
+        elapsed = min(.05, max(0, now - self.updated))
+        self.updated = now
+        dx = sum(direction[0] for direction in self.keys.values())
+        dy = sum(direction[1] for direction in self.keys.values())
+        if dx and dy:
+            dx, dy = dx / 2 ** .5, dy / 2 ** .5
+        # Document.pan measures steps of 10% of the viewport. Move at 75%
+        # of the viewport per second, independently of keyboard auto-repeat.
+        doc.pan(dx, dy, count=7.5 * elapsed)
+
+class PanAnimation:
+    duration = .10
+    frame_interval = 1 / 60
+
+    def __init__(self):
+        self.doc = None
+        self.start_position = self.target = None
+        self.started = None
+
+    @property
+    def active(self):
+        return self.started is not None
+
+    def start(self, doc, dx, dy, count=1):
+        self.advance(doc)
+        position = (doc.pan_x, doc.pan_y)
+        if self.active:
+            doc.pan_x, doc.pan_y = self.target
+        doc.pan(dx, dy, count=count)
+        self.target = (doc.pan_x, doc.pan_y)
+        doc.pan_x, doc.pan_y = position
+        self.start_position = position
+        self.doc = doc
+        self.started = monotonic() if position != self.target else None
+
+    def advance(self, doc):
+        if doc is not self.doc:
+            self.started = None
+        if not self.active:
+            return
+        progress = min(1, (monotonic() - self.started) / self.duration)
+        eased = 1 - (1 - progress) ** 3
+        x, y = self.start_position
+        tx, ty = self.target
+        doc.pan_x, doc.pan_y = x + (tx - x) * eased, y + (ty - y) * eased
+        if progress == 1:
+            doc.pan_x, doc.pan_y = self.target
+            self.started = None
+
+    def finish(self, doc):
+        if self.active and doc is self.doc:
+            doc.pan_x, doc.pan_y = self.target
+        self.started = None
 
 def resize_viewer():
     scr.resize()
@@ -1441,7 +1707,7 @@ def visual_mode(doc,bar):
             count = int(count_string)
 
         keys = shortcuts() 
-        key = scr.stdscr.getch()
+        key = scr.getch()
       
         if key in range(48,58): #numerals
             count_string = count_string + chr(key)
@@ -1569,6 +1835,12 @@ def watch_for_file_change(file_change,path):
             file_change.set() 
 
 def view(file_change,doc):
+    try:
+        _view(file_change, doc)
+    finally:
+        scr.disable_keyboard()
+
+def _view(file_change,doc):
 
     scr.get_size()
     scr.init_curses()
@@ -1577,8 +1849,7 @@ def view(file_change,doc):
         raise SystemExit(
             'Terminal does not support kitty graphics protocol'
             )
-    scr.swallow_keys()
-
+    scr.enable_keyboard()
     bar = status_bar()
     if doc.citekey:
         bar.message = doc.citekey
@@ -1586,30 +1857,60 @@ def view(file_change,doc):
     count_string = ""
     stack = [0]
     keys = shortcuts() 
+    pan_animation = PanAnimation()
+    held_pan = HeldPan()
+    last_draw = 0
 
     while True:
 
-        bar.cmd = ''.join(map(chr,stack[::-1]))
-        bar.update(doc )
-        doc.display_page(bar,doc.page)
+        pan_animation.advance(doc)
+        held_pan.advance(doc)
+        moving = pan_animation.active or held_pan.active
+        if not moving or monotonic() - last_draw >= pan_animation.frame_interval:
+            bar.cmd = ''.join(map(chr,stack[::-1]))
+            bar.update(doc)
+            doc.display_page(bar,doc.page)
+            last_draw = monotonic()
 
         if count_string == "":
             count = 1
         else:
             count = int(count_string)
         
-        scr.stdscr.nodelay(True)
-        scr.stdscr.timeout(100)
+        if moving:
+            remaining = pan_animation.frame_interval - (monotonic() - last_draw)
+            scr.timeout(max(1, ceil(remaining * 1000)))
+        else:
+            scr.timeout(100)
 
-        key = scr.stdscr.getch()
+        key = scr.getch()
         while key == -1 and not file_change.is_set():
-            key = scr.stdscr.getch()
-        scr.stdscr.nodelay(False)
+            if moving:
+                break
+            key = scr.getch()
+        scr.timeout(-1)
+
+        event = scr.last_key_event
+        if isinstance(event, KeyEvent):
+            if event.event_type == 3:
+                if event.code in (57441, 57447):  # releasing Shift ends HJKL
+                    for code in map(ord, 'hjkl'):
+                        held_pan.release(code)
+                else:
+                    held_pan.release(event.code)
+            elif event.event_type == 2 and key in keys.PAN:
+                # OS repeat does not change continuous panning speed.
+                key = KEY_EVENT
 
         if file_change.is_set():
             logging.debug('view thread sees that file has changed')
             key = keys.REFRESH[0]
             file_change.clear()
+
+        if key != -1 and key not in keys.PAN:
+            pan_animation.finish(doc)
+        if (key >= 0 and key not in keys.PAN) or key == FOCUS_OUT:
+            held_pan.stop()
 
         if key == -1:
             pass
@@ -1638,8 +1939,6 @@ def view(file_change,doc):
             doc.set_layout(doc.papersize,adjustpage=False)
 
         elif key == 27:
-            # quash stray escape codes
-            scr.swallow_keys()
             count_string = ""
             stack = [0]
 
@@ -1709,7 +2008,14 @@ def view(file_change,doc):
             stack = [0]
 
         elif key in keys.PAN:
-            doc.pan(*keys.PAN[key], count=count)
+            if (isinstance(scr.keyboard_flags, int) and scr.keyboard_flags & 10 == 10
+                    and (isinstance(event, KeyEvent) or key in
+                         (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT, curses.KEY_RIGHT))):
+                pan_animation.finish(doc)
+                code = event.code if isinstance(event, KeyEvent) else key
+                held_pan.press(doc, code, *keys.PAN[key], count=count)
+            else:
+                pan_animation.start(doc, *keys.PAN[key], count=count)
             count_string = ""
             stack = [0]
 
@@ -1857,12 +2163,11 @@ def view(file_change,doc):
         
         elif key == ord('/'):
             scr.place_string(1,scr.rows,"/")
-            curses.echo()
             scr.set_cursor(2,scr.rows)
-            s = scr.stdscr.getstr()
+            s = scr.getstr()
             search_text = s.decode('utf-8')
-            curses.noecho()
-            bar.message = doc.search_text(search_text)
+            if search_text:
+                bar.message = doc.search_text(search_text)
 
         elif key in keys.OPEN_GUI:
             subprocess.run([config.GUI_VIEWER, doc.filename], check=True)

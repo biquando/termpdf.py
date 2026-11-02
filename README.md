@@ -72,19 +72,20 @@ To cycle through several open files, press `b` (for "buffer").
 Within termpdf, key mappings are meant to be vim-style. For simple
 navigation:
 
-    j, down, space: forward [count] pages
-    k, up:          back [count] pages
-    l, right:       forward [count] sections
-    h, left:        back [count] sections
-    H/J/K/L:         pan left/down/up/right
+    j, space:       forward [count] pages
+    k:              back [count] pages
+    l:              forward [count] sections
+    h:              back [count] sections
+    H/J/K/L:         hold to pan left/down/up/right
+    arrow keys:     hold to pan in that direction
     gg:             go to beginning of document
     G:              go to end of document
     [count]G:       go to page [count]
     q:              quit
 
-These take counts: `10j` moves forward 10 pages, while `3L` pans right three
-steps. In dialogs and visual select mode, the existing navigation and
-selection shortcuts remain unchanged.
+These take counts: `10j` moves forward 10 pages, while `3L` pans right at
+three times the normal speed while held. In dialogs and visual select mode,
+the existing navigation and selection shortcuts remain unchanged.
 
 As mentioned above, if you opened several documents at once, you can cycle through these documents by pressing `b`:
 
@@ -153,7 +154,8 @@ You can also adjust the display of the document in a variety of ways:
     d:              darken using TINT_COLOR
     -:              zoom out
     +, =:           zoom in
-    H/J/K/L:         pan left/down/up/right
+    H/J/K/L:         hold to pan left/down/up/right
+    arrow keys:     hold to pan in that direction
     0:              reset zoom and pan to fit the window
     ctrl-r:         refresh
 
@@ -163,6 +165,12 @@ standalone `0` resets the view; zeros within counts such as `10G` still work.
 The status bar shows the zoom percentage. Zoom is retained when changing
 pages, and the new page starts centered. Zoom and pan are saved with the
 document settings.
+
+In Rex and other terminals that support key-release reporting, hold `H`, `J`,
+`K`, `L`, or an arrow key to move continuously, and release the key to stop.
+Movement starts without waiting for keyboard repeat. You can hold two directions to move
+diagonally. Losing focus or entering another command stops movement as well.
+Terminals without key-release reporting use animated steps with keyboard repeat.
 
 Alpha transparency and autocropping will only work on some PDFs. For manual
 cropping, see the section below, on the visual select mode.

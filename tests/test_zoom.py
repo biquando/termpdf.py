@@ -34,7 +34,6 @@ class ZoomTests(unittest.TestCase):
         self.screen.cols, self.screen.rows = 40, 21
         self.screen.cell_width, self.screen.cell_height = 10, 20
         self.screen.set_cursor = Mock()
-        self.screen.swallow_keys = Mock()
         self.frames = []
         self.placements = []
 
@@ -42,12 +41,13 @@ class ZoomTests(unittest.TestCase):
             self.frames.append((cmd.copy(), samples))
 
         def place(cmd):
-            self.placements.append(cmd.copy())
+            if cmd.get('a') == 'p':
+                self.placements.append(cmd.copy())
             return True
 
         for name, value in [('scr', self.screen),
                             ('write_chunked', upload),
-                            ('write_gr_cmd', Mock()),
+                            ('write_gr_cmd', place),
                             ('write_gr_cmd_with_response', place)]:
             patcher = patch.object(termpdf, name, value)
             patcher.start()
@@ -56,6 +56,15 @@ class ZoomTests(unittest.TestCase):
     def render(self):
         self.doc.display_page(Mock(), self.doc.page)
         return self.frames[-1][0], self.placements[-1]
+
+    def visible_samples(self):
+        cmd, samples = self.frames[-1]
+        placement = self.placements[-1]
+        x, y = placement['x'], placement['y']
+        width, height = placement['w'], placement['h']
+        return b''.join(samples[((y + row) * cmd['s'] + x) * 3:
+                                ((y + row) * cmd['s'] + x + width) * 3]
+                        for row in range(height))
 
     def test_pdf_zoom_changes_scale_and_reset_restores_fit(self):
         self.render()
@@ -106,7 +115,8 @@ class ZoomTests(unittest.TestCase):
                     self.doc.pan_x, self.doc.pan_y = .625, .375
                     self.doc.mark_all_pages_stale()
                     cmd, placement = self.render()
-                    self.assertEqual((cmd['s'], cmd['v']), (400, 400))
+                    self.assertLessEqual(cmd['s'], 800)
+                    self.assertLessEqual(cmd['v'], 800)
                     full = self.doc[0].get_pixmap(
                         matrix=fitz.Matrix(2, 2).prerotate(rotation))
                     samples = full.samples
@@ -114,15 +124,14 @@ class ZoomTests(unittest.TestCase):
                         samples[(y * full.width + 300) * 3:
                                 (y * full.width + 700) * 3]
                         for y in range(100, 500))
-                    self.assertEqual(self.frames[-1][1], expected)
+                    self.assertEqual(self.visible_samples(), expected)
                     self.assertEqual((placement['w'], placement['h']), (400, 400))
-                    self.assertEqual((placement['x'], placement['y']), (0, 0))
 
     def test_high_zoom_and_pan_remain_bounded_and_reuse_unchanged_view(self):
         self.doc.change_zoom(10000)
         self.assertEqual(self.doc.zoom, 8)
         cmd, _ = self.render()
-        self.assertEqual((cmd['s'], cmd['v']), (400, 400))
+        self.assertEqual((cmd['s'], cmd['v']), (800, 800))
         self.render()
         self.assertEqual(len(self.frames), 1)
         self.doc.pan(1, 1, count=10000)
@@ -136,6 +145,77 @@ class ZoomTests(unittest.TestCase):
         self.render()
         self.assertEqual(self.doc.zoom, .25)
         self.assertEqual((self.doc.pan_x, self.doc.pan_y), (.5, .5))
+
+    def test_nearby_pan_frames_reuse_upload_without_deleting_or_waiting(self):
+        self.doc.zoom = 4
+        with patch.object(termpdf, 'write_gr_cmd', wraps=termpdf.write_gr_cmd) as commands, \
+                patch.object(termpdf, 'write_gr_cmd_with_response',
+                             wraps=termpdf.write_gr_cmd_with_response) as acknowledgments:
+            self.render()
+            for _ in range(3):
+                self.doc.pan(1, 0)
+                self.render()
+        self.assertEqual(len(self.frames), 1)
+        self.assertEqual(acknowledgments.call_count, 1)
+        deletes = [args[0] for args, _ in commands.call_args_list if args[0]['a'] == 'd']
+        self.assertEqual(len(deletes), 1)
+        self.assertEqual(self.doc.page_states[0].origin, (720, 600))
+        self.assertTrue(all(cmd['p'] == 1 for cmd in self.placements))
+        self.assertTrue(all(cmd['q'] == 2 for cmd in self.placements[1:]))
+
+    def test_crossing_cache_boundary_uploads_new_bounded_region(self):
+        self.doc.zoom = 8
+        self.render()
+        first_cache = tuple(self.doc.page_states[0].cache_rect)
+        self.doc.pan(1, 0, count=10)
+        self.render()
+        self.assertEqual(len(self.frames), 2)
+        self.assertNotEqual(tuple(self.doc.page_states[0].cache_rect), first_cache)
+        self.assertIn(self.doc.page_states[0].viewport, self.doc.page_states[0].cache_rect)
+        self.assertTrue(all(cmd['s'] <= 802 and cmd['v'] <= 802
+                            for cmd, _ in self.frames))
+
+    def test_returning_to_evicted_page_reuploads_automatically(self):
+        self.render()
+        self.doc.goto_page(1)
+        self.render()
+        self.doc.goto_page(0)
+        with patch.object(termpdf, 'write_gr_cmd_with_response',
+                          side_effect=[False, True]) as acknowledgments:
+            self.render()
+        self.assertEqual(acknowledgments.call_count, 2)
+        self.assertEqual(len(self.frames), 3)
+        self.assertFalse(self.doc.page_states[0].stale)
+
+    def test_animation_interpolates_and_repeated_keys_accumulate(self):
+        self.doc.zoom = 4
+        self.render()
+        clock = [0]
+        animation = termpdf.PanAnimation()
+        with patch.object(termpdf, 'monotonic', side_effect=lambda: clock[0]):
+            animation.start(self.doc, 1, 0)
+            self.assertEqual(self.doc.pan_x, .5)
+            self.assertTrue(animation.active)
+            clock[0] = .05
+            animation.advance(self.doc)
+            self.assertAlmostEqual(self.doc.pan_x, .5 + .025 * .875)
+            animation.start(self.doc, 1, 0)
+            self.assertAlmostEqual(animation.target[0], .55)
+            clock[0] = .2
+            animation.advance(self.doc)
+            self.assertAlmostEqual(self.doc.pan_x, .55)
+            self.assertFalse(animation.active)
+
+    def test_finishing_animation_allows_reset_and_navigation_to_take_over(self):
+        self.doc.zoom = 4
+        self.render()
+        animation = termpdf.PanAnimation()
+        animation.start(self.doc, 1, 0)
+        animation.finish(self.doc)
+        self.doc.reset_view()
+        animation.advance(self.doc)
+        self.assertEqual((self.doc.zoom, self.doc.pan_x, self.doc.pan_y), (1, .5, .5))
+        self.assertFalse(animation.active)
 
     def test_fractional_zoom_clips_non_square_pages_without_pixel_gaps(self):
         self.doc.goto_page(1)
@@ -154,7 +234,7 @@ class ZoomTests(unittest.TestCase):
                         state.factor, state.factor).prerotate(rotation))
                     # Compare the pixels Kitty will display with a crop of an
                     # independently rendered full-page reference image.
-                    visible = state.render_key[1]
+                    visible = state.viewport
                     sx, sy = int(visible[0] - full.x), int(visible[1] - full.y)
                     width, height = placement['w'], placement['h']
                     expected = b''.join(
@@ -168,8 +248,8 @@ class ZoomTests(unittest.TestCase):
                                 ((source_y + y) * cmd['s'] + source_x + width) * 3]
                         for y in range(height))
                     self.assertEqual(actual, expected)
-                    self.assertLessEqual(cmd['s'], self.screen.width + 2)
-                    self.assertLessEqual(cmd['v'], self.screen.height - self.screen.cell_height + 2)
+                    self.assertLessEqual(cmd['s'], self.screen.width * 2 + 2)
+                    self.assertLessEqual(cmd['v'], (self.screen.height - self.screen.cell_height) * 2 + 2)
 
     def test_resize_retains_zoom_and_recalculates_viewport(self):
         self.doc.zoom = 2
@@ -179,7 +259,7 @@ class ZoomTests(unittest.TestCase):
         self.doc.mark_all_pages_stale()
         cmd, placement = self.render()
         self.assertEqual(self.doc.zoom, 2)
-        self.assertEqual((cmd['s'], cmd['v']), (300, 600))
+        self.assertEqual((cmd['s'], cmd['v']), (600, 600))
         self.assertEqual((placement['w'], placement['h']), (300, 600))
 
     def test_coordinate_conversion_accounts_for_pan_zoom_and_rotation(self):
@@ -224,8 +304,8 @@ class ZoomTests(unittest.TestCase):
 class ZoomKeyTests(unittest.TestCase):
     def run_keys(self, keys):
         screen = Mock()
-        screen.stdscr.getch.side_effect = [*keys, ord('q')]
-        doc = Mock(page=0, citekey=None)
+        screen.getch.side_effect = [*keys, ord('q')]
+        doc = Mock(page=0, citekey=None, pan_x=.5, pan_y=.5)
         with patch.object(termpdf, 'scr', screen), \
                 patch.object(termpdf, 'status_bar'), \
                 patch.object(termpdf, 'detect_support', return_value=True), \
@@ -255,14 +335,25 @@ class ZoomKeyTests(unittest.TestCase):
         self.assertEqual(doc.change_zoom.call_args_list, [call(2), call(-3)])
         doc.reset_view.assert_not_called()
 
-    def test_hjkl_arrows_and_space_still_navigate(self):
-        doc = self.run_keys([*map(ord, 'hjkl'), curses.KEY_DOWN, ord(' '),
-                             curses.KEY_UP, curses.KEY_RIGHT, curses.KEY_LEFT])
-        self.assertEqual(doc.next_page.call_args_list, [call(1)] * 3)
-        self.assertEqual(doc.prev_page.call_args_list, [call(1)] * 2)
-        self.assertEqual(doc.next_chap.call_args_list, [call(1)] * 2)
-        self.assertEqual(doc.prev_chap.call_args_list, [call(1)] * 2)
+    def test_hjkl_and_space_still_navigate(self):
+        doc = self.run_keys([*map(ord, 'hjkl'), ord(' ')])
+        self.assertEqual(doc.next_page.call_args_list, [call(1)] * 2)
+        doc.prev_page.assert_called_once_with(1)
+        doc.next_chap.assert_called_once_with(1)
+        doc.prev_chap.assert_called_once_with(1)
         doc.pan.assert_not_called()
+
+    def test_arrow_keys_pan_instead_of_navigating(self):
+        doc = self.run_keys([curses.KEY_UP, curses.KEY_DOWN,
+                             curses.KEY_LEFT, curses.KEY_RIGHT])
+        self.assertEqual(doc.pan.call_args_list, [
+            call(0, -1, count=1), call(0, 1, count=1),
+            call(-1, 0, count=1), call(1, 0, count=1),
+        ])
+        doc.next_page.assert_not_called()
+        doc.prev_page.assert_not_called()
+        doc.next_chap.assert_not_called()
+        doc.prev_chap.assert_not_called()
 
 
 if __name__ == '__main__':
