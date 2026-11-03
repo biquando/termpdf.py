@@ -35,10 +35,10 @@ class KeyboardTests(unittest.TestCase):
 
     def test_navigation_zoom_control_keys_and_enter_decode_normally(self):
         self.feed(b'\033[106;1;106u\033[61:43;2;43u\033[45;1;45u'
-                  b'\033[114;5u\033[13u\033[1;1A\033[1;1:3A')
-        self.assertEqual([self.screen.getch() for _ in range(7)],
+                  b'\033[114;5u\033[13u\033[1;1A\033[1;1:3A\033[117;5u\033[100;5u')
+        self.assertEqual([self.screen.getch() for _ in range(9)],
                          [ord('j'), ord('+'), ord('-'), 18, 10,
-                          curses.KEY_UP, termpdf.KEY_EVENT])
+                          curses.KEY_UP, termpdf.KEY_EVENT, 21, 4])
 
     def test_partial_sequence_survives_timeout_and_resize(self):
         self.feed([*b'\033[108;2:', -1, curses.KEY_RESIZE, *b'1u'])
@@ -65,7 +65,30 @@ class KeyboardTests(unittest.TestCase):
             self.screen.disable_keyboard()
             self.screen.disable_keyboard()
         self.assertEqual([args[0] for args, _ in output.buffer.write.call_args_list],
-                         [b'\033[>31u\033[?u\033[?1004h', b'\033[?1004l\033[<u'])
+                         [b'\033[>31u\033[?u\033[?1004h\033[?1000h\033[?1006h',
+                          b'\033[?1000l\033[?1006l\033[?1004l\033[<u'])
+
+    def test_refresh_restores_mouse_reporting_without_pushing_keyboard_mode_again(self):
+        self.screen.keyboard_enabled = True
+        output = Mock()
+        with patch.object(termpdf.sys, 'stdout', output), \
+                patch.object(curses, 'initscr', return_value=Mock()), \
+                patch.object(curses, 'noecho'), patch.object(curses, 'curs_set'), \
+                patch.object(curses, 'mousemask'):
+            self.screen.init_curses()
+        output.buffer.write.assert_called_once_with(b'\033[?1000h\033[?1006h')
+
+    def test_mouse_wheels_decode_in_both_axes_and_shift_scrolls_horizontally(self):
+        self.feed(b'\033[<64;10;10M\033[<65;10;10M\033[<66;10;10M'
+                  b'\033[<67;10;10M\033[<68;10;10M\033[<69;10;10M')
+        for direction in ((0, -1), (0, 1), (-1, 0), (1, 0), (-1, 0), (1, 0)):
+            self.assertEqual(self.screen.getch(), termpdf.SCROLL)
+            self.assertEqual(tuple(self.screen.last_scroll_event), direction)
+
+    def test_legacy_application_cursor_keys_still_decode(self):
+        self.feed(b'\033OA\033OB\033OC\033OD')
+        self.assertEqual([self.screen.getch() for _ in range(4)],
+                         [curses.KEY_UP, curses.KEY_DOWN, curses.KEY_RIGHT, curses.KEY_LEFT])
 
     def test_search_text_uses_decoded_keys_and_ignores_key_releases(self):
         self.feed(b'\033[97;1;97u\033[97;1:3u\033[98;1;98u'

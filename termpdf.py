@@ -23,12 +23,12 @@ __url__ = "https://github.com/dsanson/termpdf.py"
 
 __viewer_shortcuts__ = """\
 Keys:
-    j, space:       forward [count] pages
-    k:              back [count] pages
-    l:              forward [count] sections
-    h:              back [count] sections
-    H/J/K/L:         hold to pan left/down/up/right
+    h/j/k/l:         hold to pan left/down/up/right
     arrow keys:     hold to pan in that direction
+    ctrl-n:         next [count] pages and reset zoom
+    ctrl-p:         previous [count] pages and reset zoom
+    ctrl-u/ctrl-d:  scroll up/down half a window
+    mouse wheel:    scroll vertically or horizontally
     gg:             go to beginning of document
     G:              go to end of document
     [count]G:       go to page [count]
@@ -46,7 +46,7 @@ Keys:
     [count]P:       Set logical page number of current page to count
     -:              zoom out
     +, =:           zoom in
-    0:              reset zoom and pan to fit the window
+    0:              fit the page nearest the center
     ctrl-r:         refresh
     q:              quit
 """
@@ -76,6 +76,7 @@ from base64 import standard_b64encode
 from operator import attrgetter
 from collections import deque, namedtuple
 from math import ceil
+from bisect import bisect_left, bisect_right
 from tempfile import NamedTemporaryFile
 
 
@@ -84,6 +85,8 @@ from tempfile import NamedTemporaryFile
 KeyEvent = namedtuple('KeyEvent', 'key code event_type modifiers')
 KEY_EVENT = -2
 FOCUS_OUT = -3
+SCROLL = -4
+ScrollEvent = namedtuple('ScrollEvent', 'dx dy')
 
 class Config:
     def __init__(self):
@@ -157,6 +160,8 @@ class Screen:
         self.stdscr = None
         self.pending_keys = deque()
         self.image_owner = None
+        self.visible_pages = set()
+        self.last_scroll_event = None
         self.keyboard_enabled = False
         self.keyboard_flags = 0
         self.last_key_event = None
@@ -170,13 +175,13 @@ class Screen:
     def enable_keyboard(self):
         if not self.keyboard_enabled:
             # All keys, alternate/shifted keys, text, and press/release events.
-            sys.stdout.buffer.write(b'\033[>31u\033[?u\033[?1004h')
+            sys.stdout.buffer.write(b'\033[>31u\033[?u\033[?1004h\033[?1000h\033[?1006h')
             sys.stdout.flush()
             self.keyboard_enabled = True
 
     def disable_keyboard(self):
         if self.keyboard_enabled:
-            sys.stdout.buffer.write(b'\033[?1004l\033[<u')
+            sys.stdout.buffer.write(b'\033[?1000l\033[?1006l\033[?1004l\033[<u')
             sys.stdout.flush()
             self.keyboard_enabled = False
 
@@ -200,27 +205,18 @@ class Screen:
         self.stdscr.clear()
         curses.noecho()
         curses.curs_set(0) 
-        curses.mousemask(curses.REPORT_MOUSE_POSITION
-            | curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED
-            | curses.BUTTON2_PRESSED | curses.BUTTON2_RELEASED
-            | curses.BUTTON3_PRESSED | curses.BUTTON3_RELEASED
-            | curses.BUTTON4_PRESSED | curses.BUTTON4_RELEASED
-            | curses.BUTTON1_CLICKED | curses.BUTTON3_CLICKED
-            | curses.BUTTON1_DOUBLE_CLICKED 
-            | curses.BUTTON1_TRIPLE_CLICKED
-            | curses.BUTTON2_DOUBLE_CLICKED 
-            | curses.BUTTON2_TRIPLE_CLICKED
-            | curses.BUTTON3_DOUBLE_CLICKED 
-            | curses.BUTTON3_TRIPLE_CLICKED
-            | curses.BUTTON4_DOUBLE_CLICKED 
-            | curses.BUTTON4_TRIPLE_CLICKED
-            | curses.BUTTON_SHIFT | curses.BUTTON_ALT
-            | curses.BUTTON_CTRL)
-        self.stdscr.keypad(True) # Handle our own escape codes for now
+        # Decode SGR mouse and keyboard events ourselves, including wheel
+        # directions that older curses versions do not expose.
+        curses.mousemask(0)
+        self.stdscr.keypad(False)
 
         # Finish curses' screen clear before drawing the status bar or images.
         # A dummy getch() would also refresh, but can discard a resize event.
         self.stdscr.refresh()
+        if self.keyboard_enabled:
+            # mousemask(0) above disables mouse tracking during a refresh.
+            sys.stdout.buffer.write(b'\033[?1000h\033[?1006h')
+            sys.stdout.flush()
 
     def resize(self):
         self.get_size()
@@ -262,6 +258,15 @@ class Screen:
         return self.stdscr.getch()
 
     def decode_key(self, sequence):
+        if sequence.startswith(b'\033[<') and sequence[-1:] in (b'M', b'm'):
+            button, x, y = map(int, sequence[3:-1].split(b';'))
+            if sequence[-1:] == b'M' and button & 64:
+                dx, dy = ((0, -1), (0, 1), (-1, 0), (1, 0))[button & 3]
+                if button & 4 and dy:  # Shift+wheel is horizontal scrolling.
+                    dx, dy = dy, 0
+                self.last_scroll_event = ScrollEvent(dx, dy)
+                return SCROLL
+            return KEY_EVENT
         if sequence.startswith(b'\033[?') and sequence.endswith(b'u'):
             self.keyboard_flags = int(sequence[3:-1])
             return None
@@ -310,6 +315,7 @@ class Screen:
 
     def getch(self):
         self.last_key_event = None
+        self.last_scroll_event = None
         while True:
             key = self.raw_key(continuation=bool(self.key_sequence))
             if key == -1:
@@ -324,7 +330,7 @@ class Screen:
                     return key
                 self.key_sequence.append(key)
                 continue
-            if self.key_sequence == b'\033' and key != ord('['):
+            if self.key_sequence == b'\033' and key not in (ord('['), ord('O')):
                 self.pending_keys.appendleft(key)
                 self.key_sequence.clear()
                 return 27
@@ -399,6 +405,8 @@ class Screen:
                 self.pending_keys.extend(response)
 
     def clear(self):
+        self.visible_pages.clear()
+        self.image_owner = None
         sys.stdout.buffer.write('\033[2J'.encode('ascii'))
 
     def set_cursor(self,c,r):
@@ -450,12 +458,16 @@ class Document(fitz.Document):
         self.prevpage = 0
         self.pages = self.page_count - 1
         self.first_page_offset = 1
-        self.logical_pages = list(range(0 + self.first_page_offset, self.pages + self.first_page_offset))
+        self.logical_pages = [str(i + self.first_page_offset) for i in range(self.page_count)]
         self.chapter = 0
         self.rotation = 0
         self.zoom = 1.0
         self.pan_x = 0.5
         self.pan_y = 0.5
+        self.camera_x = self.camera_y = None
+        self.fit_page = None
+        self._layout_key = None
+        self.page_layout = []
         self.fontsize = fontsize
         self.width = width
         self.height = height
@@ -482,6 +494,9 @@ class Document(fitz.Document):
                  'zoom': self.zoom,
                  'pan_x': self.pan_x,
                  'pan_y': self.pan_y,
+                 'camera_x': self.camera_x,
+                 'camera_y': self.camera_y,
+                 'fit_page': self.fit_page,
                  'autocrop': self.autocrop,
                  'manualcrop': self.manualcrop,
                  'manualcroprect': self.manualcroprect,
@@ -505,6 +520,7 @@ class Document(fitz.Document):
             self.page = p
         if self.page != self.prevpage:
             self.pan_x = self.pan_y = 0.5
+            self.camera_x = self.camera_y = None
         self.logicalpage = self.page_to_logical(self.page)
     
     def goto_logical_page(self, p):
@@ -513,9 +529,11 @@ class Document(fitz.Document):
 
     def next_page(self, count=1):
         self.goto_page(self.page + count)
+        self.reset_view()
 
     def prev_page(self, count=1):
         self.goto_page(self.page - count)
+        self.reset_view()
 
     def goto_chap(self, n):
         toc = self.get_toc()
@@ -703,28 +721,113 @@ class Document(fitz.Document):
         self.page_states = [ Page_State(i) for i in range(0,self.pages + 1) ]
 
     def change_zoom(self, steps):
+        self.ensure_view()
         # Bound the exponent as well as the result for large numeric counts.
         self.zoom = max(0.25, min(8.0, self.zoom * 1.25 ** max(-32, min(32, steps))))
+        self.ensure_view()
 
     def pan(self, dx, dy, count=1):
-        state = self.page_states[self.page]
-        width, height = state.image_size
-        self.pan_x += dx * count * max(scr.cell_width, scr.width / 10) / width
-        self.pan_y += dy * count * max(scr.cell_height, (scr.height - scr.cell_height) / 10) / height
-        self.pan_x = max(0.0, min(1.0, self.pan_x))
-        self.pan_y = max(0.0, min(1.0, self.pan_y))
-        edge_x = min(.5, scr.width / (2 * width))
-        edge_y = min(.5, (scr.height - scr.cell_height) / (2 * height))
-        self.pan_x = max(edge_x, min(1 - edge_x, self.pan_x))
-        self.pan_y = max(edge_y, min(1 - edge_y, self.pan_y))
+        factor = self.ensure_view()
+        self.camera_x += dx * count * max(scr.cell_width, scr.width / 10) / factor
+        self.camera_y += dy * count * max(scr.cell_height, (scr.height - scr.cell_height) / 10) / factor
+        self.ensure_view()
 
     def reset_view(self):
+        self.ensure_view()
         self.zoom = 1.0
+        self.fit_page = self.page
+        rect = self.page_layout[self.page]
+        self.camera_x, self.camera_y = tuple((rect.tl + rect.br) / 2)
         self.pan_x = self.pan_y = 0.5
+        self.ensure_view()
+
+    def prepare_page(self, p):
+        page = self.load_page(p)
+        if self.is_pdf:
+            page.set_cropbox(page.mediabox)
+            if self.manualcrop and self.manualcroprect != [None, None]:
+                page.set_cropbox(fitz.Rect(*self.manualcroprect))
+            elif self.autocrop:
+                crop = self.auto_crop(page)
+                if not crop.is_empty:
+                    page.set_cropbox(crop)
+        return page
+
+    def ensure_view(self):
+        """Lay out pages in document points, sharing one scale and camera."""
+        key = (self.page_count, self.rotation, self.autocrop, self.manualcrop,
+               repr(self.manualcroprect), self.papersize)
+        if self._layout_key != key:
+            anchor_position = None
+            if self.page_layout and self.camera_x is not None and self.camera_y is not None:
+                old = self.page_layout[min(self.page, len(self.page_layout) - 1)]
+                anchor_position = ((self.camera_x - old.x0) / old.width,
+                                   (self.camera_y - old.y0) / old.height)
+            sizes = []
+            for p in range(self.page_count):
+                rect = self.prepare_page(p).bound()
+                width, height = rect.width, rect.height
+                if self.rotation in (90, 270):
+                    width, height = height, width
+                sizes.append((width, height))
+            self.canvas_width = max(width for width, height in sizes)
+            self.page_layout = []
+            top = 0
+            for width, height in sizes:
+                left = (self.canvas_width - width) / 2
+                self.page_layout.append(fitz.Rect(left, top, left + width, top + height))
+                top += height + 16  # page gap, in document points
+            self.canvas_height = top - 16
+            self.page_centers = [(rect.y0 + rect.y1) / 2 for rect in self.page_layout]
+            self.page_bottoms = [rect.y1 for rect in self.page_layout]
+            self._layout_key = key
+            if anchor_position is not None:
+                rect = self.page_layout[self.page]
+                self.camera_x = rect.x0 + rect.width * anchor_position[0]
+                self.camera_y = rect.y0 + rect.height * anchor_position[1]
+            if len(self.page_states) != self.page_count:
+                self.mark_all_pages_stale()
+        if self.fit_page is None:
+            self.fit_page = self.page
+        self.fit_page = max(0, min(self.pages, self.fit_page))
+        anchor = self.page_layout[self.fit_page]
+        factor = min(scr.width / anchor.width,
+                     (scr.height - scr.cell_height) / anchor.height) * self.zoom
+        if self.camera_x is None or self.camera_y is None:
+            rect = self.page_layout[self.page]
+            self.camera_x = rect.x0 + rect.width * self.pan_x
+            self.camera_y = rect.y0 + rect.height * self.pan_y
+        half_w = scr.width / (2 * factor)
+        half_h = (scr.height - scr.cell_height) / (2 * factor)
+        first = min(self.page_centers[0], half_h)
+        last = max(self.page_centers[-1], self.canvas_height - half_h)
+        self.camera_y = max(first, min(last, self.camera_y))
+        index = bisect_left(self.page_centers, self.camera_y)
+        candidates = (max(0, index - 1), min(self.pages, index))
+        self.page = min(candidates, key=lambda p: abs(self.page_centers[p] - self.camera_y))
+        self.logicalpage = self.page_to_logical(self.page)
+        rect = self.page_layout[self.page]
+        if rect.width <= 2 * half_w:
+            self.camera_x = (rect.x0 + rect.x1) / 2
+        else:
+            self.camera_x = max(rect.x0 + half_w, min(rect.x1 - half_w, self.camera_x))
+        # Retain normalized coordinates for compatibility with saved settings.
+        self.pan_x = (self.camera_x - rect.x0) / rect.width
+        self.pan_y = (self.camera_y - rect.y0) / rect.height
+        return factor
+
+    def view_position(self):
+        self.ensure_view()
+        return self.camera_x, self.camera_y
+
+    def set_view_position(self, x, y):
+        self.camera_x, self.camera_y = x, y
+        self.ensure_view()
 
     def clear_page(self, p):
-        cmd = {'a': 'd', 'd': 'a', 'i': p + 1}
+        cmd = {'a': 'd', 'd': 'i', 'i': p + 1, 'p': 1}
         write_gr_cmd(cmd)
+        scr.visible_pages.discard(p)
 
     def cells_to_pixels(self, *coords):
         state = self.page_states[self.page]
@@ -804,128 +907,100 @@ class Document(fitz.Document):
         return crop
 
     def display_page(self, bar, p, display=True):
+        factor = self.ensure_view()
+        dw, dh = scr.width, scr.height - scr.cell_height
+        left = self.camera_x - dw / (2 * factor)
+        top = self.camera_y - dh / (2 * factor)
+        bottom = top + dh / factor
+        if display and scr.image_owner != id(self):
+            if scr.image_owner is not None:
+                self.mark_all_pages_stale()
+            write_gr_cmd({'a': 'd', 'd': 'a'})
+            scr.visible_pages.clear()
+            scr.image_owner = id(self)
 
-        page = self.load_page(p)
-        page_state = self.page_states[p]
+        slices = []
+        first = bisect_right(self.page_bottoms, top)
+        for index in range(first, self.page_count):
+            rect = self.page_layout[index]
+            if rect.y0 >= bottom:
+                break
+            page = self.load_page(index)
+            mat = fitz.Matrix(factor, factor).prerotate(self.rotation)
+            bounds = (page.bound() * mat).irect
+            px, py = round((rect.x0 - left) * factor), round((rect.y0 - top) * factor)
+            x0, y0 = max(0, px), max(0, py)
+            x1, y1 = min(dw, px + bounds.width), min(dh, py + bounds.height)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            visible = fitz.Rect(bounds.x0 + x0 - px, bounds.y0 + y0 - py,
+                                bounds.x0 + x1 - px, bounds.y0 + y1 - py)
+            slices.append((index, page, mat, bounds, visible, x0, y0))
 
-        if self.manualcrop and self.manualcroprect != [None,None] and self.is_pdf:
-            page.set_cropbox(fitz.Rect(self.manualcroprect[0],self.manualcroprect[1]))
+        visible_pages = {entry[0] for entry in slices}
+        if display:
+            for index in scr.visible_pages - visible_pages:
+                self.clear_page(index)
+        for args in slices:
+            self.render_slice(bar, *args, display=display)
 
-        elif self.autocrop and self.is_pdf:
-            page.set_cropbox(page.mediabox)
-            crop = self.auto_crop(page)
-            page.set_cropbox(crop)
-
-        elif self.is_pdf:
-            page.set_cropbox(page.mediabox)
-
-        dw = scr.width
-        dh = scr.height - scr.cell_height
-
-        if self.rotation in [0,180]:
-            pw = page.bound().width
-            ph = page.bound().height
-        else:
-            pw = page.bound().height
-            ph = page.bound().width
-        
-        # calculate zoom factor
-        fx = dw / pw
-        fy = dh / ph
-        factor = min(fx,fy) * self.zoom
-        page_state.factor = factor
-        mat = fitz.Matrix(factor, factor).prerotate(self.rotation)
-        bounds = (page.bound() * mat).irect
-        zw, zh = bounds.width, bounds.height
-        page_state.image_size = (zw, zh)
-
-        # Keep the viewport inside the page, centering any axis that fits.
-        vw, vh = min(dw, zw), min(dh, zh)
-        sx = max(0, min(zw - vw, round(self.pan_x * zw - vw / 2)))
-        sy = max(0, min(zh - vh, round(self.pan_y * zh - vh / 2)))
-        self.pan_x = (sx + vw / 2) / zw
-        self.pan_y = (sy + vh / 2) / zh
-        visible = fitz.Rect(bounds.x0 + sx, bounds.y0 + sy,
-                            bounds.x0 + sx + vw, bounds.y0 + sy + vh)
-
-        pix_x, pix_y = (dw - vw) // 2, (dh - vh) // 2
-        l_col = pix_x // scr.cell_width + 1
-        t_row = pix_y // scr.cell_height + 1
+    def render_slice(self, bar, p, page, mat, bounds, visible, pix_x, pix_y, display=True):
+        state = self.page_states[p]
+        dw, dh = scr.width, scr.height - scr.cell_height
+        vw, vh = int(visible.width), int(visible.height)
+        l_col, t_row = pix_x // scr.cell_width + 1, pix_y // scr.cell_height + 1
         offset_x, offset_y = pix_x % scr.cell_width, pix_y % scr.cell_height
-        page_state.place = (l_col, t_row,
-                            l_col + ceil((offset_x + vw) / scr.cell_width) - 1,
-                            t_row + ceil((offset_y + vh) / scr.cell_height) - 1)
-        page_state.matrix = page.rotation_matrix * mat
-        page_state.origin = (visible.x0 - offset_x, visible.y0 - offset_y)
-
-        page_state.viewport = visible
+        state.factor = abs(mat.a) or abs(mat.b)
+        state.image_size = (bounds.width, bounds.height)
+        state.place = (l_col, t_row,
+                       l_col + ceil((offset_x + vw) / scr.cell_width) - 1,
+                       t_row + ceil((offset_y + vh) / scr.cell_height) - 1)
+        state.matrix = page.rotation_matrix * mat
+        state.origin = (visible.x0 - offset_x, visible.y0 - offset_y)
+        state.viewport = visible
         render_key = (tuple(mat), tuple(bounds), dw, dh)
-        uploaded = (page_state.stale or page_state.render_key != render_key
-                    or visible not in page_state.cache_rect)
+        uploaded = (state.stale or state.render_key != render_key
+                    or visible not in state.cache_rect)
         if uploaded:
-            # Cache half a viewport on each side. Panning inside this area
-            # changes only Kitty's source rectangle, with at most 4x the
-            # viewport's pixel storage regardless of the zoom level.
-            cached = fitz.Rect(max(bounds.x0, visible.x0 - vw // 2),
-                               max(bounds.y0, visible.y0 - vh // 2),
-                               min(bounds.x1, visible.x1 + vw // 2),
-                               min(bounds.y1, visible.y1 + vh // 2))
+            # Retain nearby pixels so scrolling usually only moves a source
+            # rectangle in Kitty. Each page's cache is bounded by the window.
+            cached = fitz.Rect(max(bounds.x0, visible.x0 - dw // 2),
+                               max(bounds.y0, visible.y0 - dh // 2),
+                               min(bounds.x1, visible.x1 + dw // 2),
+                               min(bounds.y1, visible.y1 + dh // 2))
             pix = page.get_pixmap(matrix=mat, alpha=self.alpha, clip=cached * ~mat)
-
             if self.invert:
                 pix.invert_irect()
-
-            if self.tint:
-                tint = fitz.utils.getColor(self.tint_color)
-                red = int(tint[0] * 256)
-                blue = int(tint[1] * 256)
-                green = int(tint[2] * 256)
-                # pix.tint_with(red, blue, green)
-                # tinting disabled due to unresolved bug
-
-            # build cmd to send to kitty
-            cmd = {'i': p + 1, 't': 'd', 's': pix.width, 'v': pix.height, 'q': 2}
-
-            if self.alpha:
-                cmd['f'] = 32
-            else:
-                cmd['f'] = 24
-
-            # transfer the image
+            cmd = {'i': p + 1, 't': 'd', 's': pix.width, 'v': pix.height,
+                   'q': 2, 'f': 32 if self.alpha else 24}
             write_chunked(cmd, pix.samples)
-            page_state.render_key = render_key
-            page_state.cache_rect = fitz.Rect(pix.irect)
-            page_state.stale = False
-        page_state.source = (int(visible.x0 - page_state.cache_rect.x0),
-                             int(visible.y0 - page_state.cache_rect.y0))
-
-        if display:
-            # clear prevpage
-            new_placement = scr.image_owner != (id(self), p)
-            if new_placement:
-                self.clear_page(self.prevpage)
-                scr.image_owner = (id(self), p)
-            scr.set_cursor(l_col,t_row)
-            # display the image
-            cmd = {'a': 'p', 'i': p + 1, 'p': 1, 'z': -1, 'C': 1,
-                   'X': offset_x, 'Y': offset_y,
-                   'x': page_state.source[0], 'y': page_state.source[1],
-                   'w': vw, 'h': vh}
-            # Check new uploads once; cached pan frames need no round trip.
-            if uploaded or new_placement:
-                success = write_gr_cmd_with_response(cmd)
-            else:
-                cmd['q'] = 2
-                write_gr_cmd(cmd)
-                success = True
-            if not success:
-                page_state.stale = True
-                if not uploaded:
-                    # Kitty may have evicted an off-screen cached image.
-                    self.display_page(bar, p, display)
-                    return
-                bar.message = 'failed to load page ' + str(p+1)
-                bar.update(self)
+            state.render_key = render_key
+            state.cache_rect = fitz.Rect(pix.irect)
+            state.stale = False
+        state.source = (int(visible.x0 - state.cache_rect.x0),
+                        int(visible.y0 - state.cache_rect.y0))
+        if not display:
+            return
+        new_placement = p not in scr.visible_pages
+        scr.set_cursor(l_col, t_row)
+        cmd = {'a': 'p', 'i': p + 1, 'p': 1, 'z': -1, 'C': 1,
+               'X': offset_x, 'Y': offset_y,
+               'x': state.source[0], 'y': state.source[1], 'w': vw, 'h': vh}
+        if uploaded or new_placement:
+            success = write_gr_cmd_with_response(cmd)
+        else:
+            cmd['q'] = 2
+            write_gr_cmd(cmd)
+            success = True
+        if success:
+            scr.visible_pages.add(p)
+        else:
+            state.stale = True
+            if not uploaded:
+                self.render_slice(bar, p, page, mat, bounds, visible, pix_x, pix_y, display)
+                return
+            bar.message = 'failed to load page ' + str(p + 1)
+            bar.update(self)
 
     def show_toc(self, bar):
 
@@ -1287,6 +1362,10 @@ class shortcuts:
         self.GO_BACK          = [ord('p')]
         self.NEXT_CHAP        = [ord('l'), curses.KEY_RIGHT]
         self.PREV_CHAP        = [ord('h'), curses.KEY_LEFT]
+        self.PAGE_DOWN        = [14]                             # CTRL-N
+        self.PAGE_UP          = [16]                             # CTRL-P
+        self.HALF_PAGE_DOWN   = [4]                              # CTRL-D
+        self.HALF_PAGE_UP     = [21]                             # CTRL-U
         self.BUFFER_CYCLE     = [ord('b')]
         self.BUFFER_CYCLE_REV = [ord('B')]
         self.HINTS            = [ord('f')]
@@ -1312,8 +1391,8 @@ class shortcuts:
         self.ZOOM_IN          = [ord('+'), ord('=')]
         self.ZOOM_OUT         = [ord('-')]
         self.RESET_VIEW       = [ord('0')]
-        self.PAN              = {ord('H'): (-1, 0), ord('J'): (0, 1),
-                                 ord('K'): (0, -1), ord('L'): (1, 0),
+        self.PAN              = {ord('h'): (-1, 0), ord('j'): (0, 1),
+                                 ord('k'): (0, -1), ord('l'): (1, 0),
                                  curses.KEY_LEFT: (-1, 0), curses.KEY_DOWN: (0, 1),
                                  curses.KEY_UP: (0, -1), curses.KEY_RIGHT: (1, 0)}
         self.OPEN_GUI         = [ord('X')]
@@ -1610,12 +1689,12 @@ class PanAnimation:
 
     def start(self, doc, dx, dy, count=1):
         self.advance(doc)
-        position = (doc.pan_x, doc.pan_y)
+        position = doc.view_position()
         if self.active:
-            doc.pan_x, doc.pan_y = self.target
+            doc.set_view_position(*self.target)
         doc.pan(dx, dy, count=count)
-        self.target = (doc.pan_x, doc.pan_y)
-        doc.pan_x, doc.pan_y = position
+        self.target = doc.view_position()
+        doc.set_view_position(*position)
         self.start_position = position
         self.doc = doc
         self.started = monotonic() if position != self.target else None
@@ -1629,14 +1708,14 @@ class PanAnimation:
         eased = 1 - (1 - progress) ** 3
         x, y = self.start_position
         tx, ty = self.target
-        doc.pan_x, doc.pan_y = x + (tx - x) * eased, y + (ty - y) * eased
+        doc.set_view_position(x + (tx - x) * eased, y + (ty - y) * eased)
         if progress == 1:
-            doc.pan_x, doc.pan_y = self.target
+            doc.set_view_position(*self.target)
             self.started = None
 
     def finish(self, doc):
         if self.active and doc is self.doc:
-            doc.pan_x, doc.pan_y = self.target
+            doc.set_view_position(*self.target)
         self.started = None
 
 def resize_viewer():
@@ -1893,11 +1972,7 @@ def _view(file_change,doc):
         event = scr.last_key_event
         if isinstance(event, KeyEvent):
             if event.event_type == 3:
-                if event.code in (57441, 57447):  # releasing Shift ends HJKL
-                    for code in map(ord, 'hjkl'):
-                        held_pan.release(code)
-                else:
-                    held_pan.release(event.code)
+                held_pan.release(event.code)
             elif event.event_type == 2 and key in keys.PAN:
                 # OS repeat does not change continuous panning speed.
                 key = KEY_EVENT
@@ -1907,9 +1982,11 @@ def _view(file_change,doc):
             key = keys.REFRESH[0]
             file_change.clear()
 
-        if key != -1 and key not in keys.PAN:
-            pan_animation.finish(doc)
+        if key in map(ord, 'HJKL'):
+            key = KEY_EVENT
         if (key >= 0 and key not in keys.PAN) or key == FOCUS_OUT:
+            pan_animation.finish(doc)
+        if (key >= 0 and key not in keys.PAN) or key in (FOCUS_OUT, SCROLL):
             held_pan.stop()
 
         if key == -1:
@@ -2019,28 +2096,30 @@ def _view(file_change,doc):
             count_string = ""
             stack = [0]
 
-        elif key in keys.NEXT_PAGE:
+        elif key in keys.HALF_PAGE_UP or key in keys.HALF_PAGE_DOWN:
+            direction = -1 if key in keys.HALF_PAGE_UP else 1
+            height = scr.height - scr.cell_height
+            steps = count * height / (2 * max(scr.cell_height, height / 10))
+            pan_animation.start(doc, 0, direction, count=steps)
+            count_string = ""
+            stack = [0]
+
+        elif key == SCROLL:
+            scroll = scr.last_scroll_event
+            pan_animation.start(doc, scroll.dx, scroll.dy, count=.25)
+
+        elif key in keys.PAGE_DOWN:
             doc.next_page(count)
             count_string = ""
             stack = [0]
 
-        elif key in keys.PREV_PAGE:
+        elif key in keys.PAGE_UP:
             doc.prev_page(count)
             count_string = ""
             stack = [0]
 
         elif key in keys.GO_BACK:
             doc.goto_page(doc.prevpage)
-            count_string = ""
-            stack = [0]
-
-        elif key in keys.NEXT_CHAP:
-            doc.next_chap(count)
-            count_string = ""
-            stack = [0]
-
-        elif key in keys.PREV_CHAP:
-            doc.prev_chap(count)
             count_string = ""
             stack = [0]
 

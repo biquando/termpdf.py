@@ -94,15 +94,17 @@ class ZoomTests(unittest.TestCase):
             self.assertAlmostEqual(doc.page_states[0].factor, factor * 1.25)
             self.assertEqual(doc.page_count, pages)
 
-    def test_zoom_out_centers_small_page_and_cannot_pan_into_blank_space(self):
+    def test_zoom_out_centers_pages_and_vertical_pan_can_reach_the_next_page(self):
         self.doc.change_zoom(-1)
-        cmd, placement = self.render()
+        self.render()
+        cmd = next(cmd for cmd, _ in self.frames if cmd['i'] == 1)
+        placement = next(cmd for cmd in self.placements if cmd['i'] == 1)
         self.assertEqual((cmd['s'], cmd['v']), (320, 320))
-        self.screen.set_cursor.assert_called_with(5, 3)
+        self.screen.set_cursor.assert_any_call(5, 3)
         self.doc.pan(1, 1, count=100)
         self.render()
         self.assertEqual((self.doc.pan_x, self.doc.pan_y), (.5, .5))
-        self.assertEqual(len(self.frames), 1)
+        self.assertEqual(self.doc.page, 1)
         self.assertEqual(placement['C'], 1)
 
     def test_rendered_viewport_matches_full_raster_at_every_rotation(self):
@@ -113,6 +115,7 @@ class ZoomTests(unittest.TestCase):
                     self.doc.rotation = rotation
                     self.doc.zoom = 2
                     self.doc.pan_x, self.doc.pan_y = .625, .375
+                    self.doc.camera_x = self.doc.camera_y = None
                     self.doc.mark_all_pages_stale()
                     cmd, placement = self.render()
                     self.assertLessEqual(cmd['s'], 800)
@@ -136,11 +139,12 @@ class ZoomTests(unittest.TestCase):
         self.assertEqual(len(self.frames), 1)
         self.doc.pan(1, 1, count=10000)
         self.render()
-        state = self.doc.page_states[0]
-        self.assertEqual(state.origin, (2800, 2800))
+        state = self.doc.page_states[self.doc.page]
+        self.assertEqual(self.doc.page, 1)
+        self.assertEqual(state.origin, (2000, 3600))
         self.doc.pan(-1, -1, count=10000)
         self.render()
-        self.assertEqual(state.origin, (0, 0))
+        self.assertEqual(self.doc.page_states[0].origin, (0, 0))
         self.doc.change_zoom(-10000)
         self.render()
         self.assertEqual(self.doc.zoom, .25)
@@ -200,7 +204,7 @@ class ZoomTests(unittest.TestCase):
             animation.advance(self.doc)
             self.assertAlmostEqual(self.doc.pan_x, .5 + .025 * .875)
             animation.start(self.doc, 1, 0)
-            self.assertAlmostEqual(animation.target[0], .55)
+            self.assertAlmostEqual(animation.target[0], 220)
             clock[0] = .2
             animation.advance(self.doc)
             self.assertAlmostEqual(self.doc.pan_x, .55)
@@ -228,6 +232,7 @@ class ZoomTests(unittest.TestCase):
                     self.doc.rotation = rotation
                     self.doc.zoom = zoom
                     self.doc.pan_x, self.doc.pan_y = .7, .3
+                    self.doc.camera_x = self.doc.camera_y = None
                     cmd, placement = self.render()
                     state = self.doc.page_states[1]
                     full = page.get_pixmap(matrix=fitz.Matrix(
@@ -268,6 +273,7 @@ class ZoomTests(unittest.TestCase):
                 self.doc.zoom = 2
                 self.doc.rotation = rotation
                 self.doc.pan_x, self.doc.pan_y = .625, .375
+                self.doc.camera_x = self.doc.camera_y = None
                 self.render()
                 cells = ((1, 1), (3, 4), (20, 10))
                 points = self.doc.cells_to_pixels(*cells)
@@ -302,10 +308,13 @@ class ZoomTests(unittest.TestCase):
 
 
 class ZoomKeyTests(unittest.TestCase):
-    def run_keys(self, keys):
+    def run_keys(self, keys, scroll=None):
         screen = Mock()
+        screen.height, screen.cell_height = 420, 20
+        screen.last_scroll_event = scroll
         screen.getch.side_effect = [*keys, ord('q')]
         doc = Mock(page=0, citekey=None, pan_x=.5, pan_y=.5)
+        doc.view_position.return_value = (0, 0)
         with patch.object(termpdf, 'scr', screen), \
                 patch.object(termpdf, 'status_bar'), \
                 patch.object(termpdf, 'detect_support', return_value=True), \
@@ -315,7 +324,7 @@ class ZoomKeyTests(unittest.TestCase):
         return doc
 
     def test_zoom_pan_and_reset_bindings(self):
-        doc = self.run_keys(map(ord, '+=-HJKL0'))
+        doc = self.run_keys(map(ord, '+=-hjkl0'))
         self.assertEqual(doc.change_zoom.call_args_list, [call(1), call(1), call(-1)])
         self.assertEqual(doc.pan.call_args_list, [
             call(-1, 0, count=1), call(0, 1, count=1),
@@ -329,19 +338,33 @@ class ZoomKeyTests(unittest.TestCase):
         doc.set_layout.assert_not_called()
 
     def test_zero_inside_numeric_counts_does_not_reset(self):
-        doc = self.run_keys(map(ord, '10G10L2+3-'))
+        doc = self.run_keys(map(ord, '10G10l2+3-'))
         doc.goto_logical_page.assert_called_once_with(10)
         doc.pan.assert_called_once_with(1, 0, count=10)
         self.assertEqual(doc.change_zoom.call_args_list, [call(2), call(-3)])
         doc.reset_view.assert_not_called()
 
-    def test_hjkl_and_space_still_navigate(self):
-        doc = self.run_keys([*map(ord, 'hjkl'), ord(' ')])
-        self.assertEqual(doc.next_page.call_args_list, [call(1)] * 2)
+    def test_ctrl_n_and_ctrl_p_navigate(self):
+        doc = self.run_keys([14, 16])
+        doc.next_page.assert_called_once_with(1)
         doc.prev_page.assert_called_once_with(1)
-        doc.next_chap.assert_called_once_with(1)
-        doc.prev_chap.assert_called_once_with(1)
+        doc.next_chap.assert_not_called()
+        doc.prev_chap.assert_not_called()
         doc.pan.assert_not_called()
+
+    def test_ctrl_u_and_ctrl_d_scroll_half_windows_with_counts_without_resetting_zoom(self):
+        doc = self.run_keys([21, ord('3'), 4])
+        self.assertEqual(doc.pan.call_args_list,
+                         [call(0, -1, count=5), call(0, 1, count=15)])
+        doc.reset_view.assert_not_called()
+        doc.change_zoom.assert_not_called()
+        doc.next_page.assert_not_called()
+        doc.prev_page.assert_not_called()
+
+    def test_uppercase_hjkl_do_nothing_and_leave_counts_intact(self):
+        doc = self.run_keys(map(ord, 'HJKL10Hj'))
+        doc.pan.assert_called_once_with(0, 1, count=10)
+        doc.next_page.assert_not_called()
 
     def test_arrow_keys_pan_instead_of_navigating(self):
         doc = self.run_keys([curses.KEY_UP, curses.KEY_DOWN,
@@ -354,6 +377,12 @@ class ZoomKeyTests(unittest.TestCase):
         doc.prev_page.assert_not_called()
         doc.next_chap.assert_not_called()
         doc.prev_chap.assert_not_called()
+
+    def test_mouse_scroll_moves_the_document_in_each_axis(self):
+        for direction in ((0, 1), (1, 0)):
+            with self.subTest(direction=direction):
+                doc = self.run_keys([termpdf.SCROLL], termpdf.ScrollEvent(*direction))
+                doc.pan.assert_called_once_with(*direction, count=.25)
 
 
 if __name__ == '__main__':

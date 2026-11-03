@@ -72,20 +72,24 @@ To cycle through several open files, press `b` (for "buffer").
 Within termpdf, key mappings are meant to be vim-style. For simple
 navigation:
 
-    j, space:       forward [count] pages
-    k:              back [count] pages
-    l:              forward [count] sections
-    h:              back [count] sections
-    H/J/K/L:         hold to pan left/down/up/right
+    h/j/k/l:         hold to pan left/down/up/right
     arrow keys:     hold to pan in that direction
+    ctrl-n:         next [count] pages and reset zoom
+    ctrl-p:         previous [count] pages and reset zoom
+    ctrl-u/ctrl-d:  scroll up/down half a window, keeping zoom
+    mouse wheel:    scroll vertically or horizontally
     gg:             go to beginning of document
     G:              go to end of document
     [count]G:       go to page [count]
     q:              quit
 
-These take counts: `10j` moves forward 10 pages, while `3L` pans right at
-three times the normal speed while held. In dialogs and visual select mode,
-the existing navigation and selection shortcuts remain unchanged.
+Pages form a continuous vertical document: pan or scroll past a page edge to
+reach the next page. The status bar tracks the page nearest the center of the
+window. `HJKL` have no bindings in normal viewing mode.
+
+These take counts: `10` followed by Ctrl+N moves forward 10 pages, while `3l`
+pans right at three times the normal speed while held. In dialogs and visual
+select mode, the existing navigation and selection shortcuts remain unchanged.
 
 As mentioned above, if you opened several documents at once, you can cycle through these documents by pressing `b`:
 
@@ -154,23 +158,27 @@ You can also adjust the display of the document in a variety of ways:
     d:              darken using TINT_COLOR
     -:              zoom out
     +, =:           zoom in
-    H/J/K/L:         hold to pan left/down/up/right
+    h/j/k/l:         hold to pan left/down/up/right
     arrow keys:     hold to pan in that direction
-    0:              reset zoom and pan to fit the window
+    0:              fit the page nearest the center
     ctrl-r:         refresh
 
-Zoom works for PDFs and reflowable formats such as EPUB, in 25% steps from
-25% to 800% of the fit-to-window size. Panning stops at the page edges. A
-standalone `0` resets the view; zeros within counts such as `10G` still work.
-The status bar shows the zoom percentage. Zoom is retained when changing
-pages, and the new page starts centered. Zoom and pan are saved with the
-document settings.
+Zoom works for PDFs and reflowable formats such as EPUB, from 25% to 800% of
+the last fit-to-window scale. Scrolling between pages preserves that scale.
+A standalone `0` resets zoom and centers the page nearest the window center;
+zeros within counts such as `10G` still work. Ctrl+N and Ctrl+P jump to the
+next or previous page, reset zoom, and fit that page in the window. Zoom and
+the continuous scroll position are saved with the document settings.
 
-In Rex and other terminals that support key-release reporting, hold `H`, `J`,
-`K`, `L`, or an arrow key to move continuously, and release the key to stop.
+In kitty and other terminals that support key-release reporting, hold `h`, `j`,
+`k`, `l`, or an arrow key to move continuously, and release the key to stop.
 Movement starts without waiting for keyboard repeat. You can hold two directions to move
 diagonally. Losing focus or entering another command stops movement as well.
 Terminals without key-release reporting use animated steps with keyboard repeat.
+The mouse wheel and trackpad support vertical and horizontal scrolling.
+Shift+wheel also scrolls horizontally.
+Ctrl+U and Ctrl+D scroll up or down by half the visible height without changing
+zoom. Counts work too: `3` followed by Ctrl+D scrolls down three half-windows.
 
 Alpha transparency and autocropping will only work on some PDFs. For manual
 cropping, see the section below, on the visual select mode.
