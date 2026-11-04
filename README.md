@@ -185,6 +185,12 @@ cropping, see the section below, on the visual select mode.
 
 The refresh command is helpful if the page fails to display, or displays
 funny: try hitting `ctrl-r` to see if that fixes the problem.
+Changes to the active document are detected by a native filesystem watcher
+(via `watchdog`), which wakes the input loop and starts a refresh immediately.
+This also works when an editor saves by replacing the file. A file change closes
+any open dialog or search prompt so the viewer can reload the document.
+If a save is incomplete, the viewer keeps the current document and retries with
+a short backoff. Symlinked documents are watched at both the link and its target.
 
 ## Visual Select Mode
 

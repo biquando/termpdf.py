@@ -96,7 +96,7 @@ class ResizeTests(unittest.TestCase):
             call.invalidate_other(),
             call.display(bar_type.return_value, 0),
         ])
-        # Keep the existing low-CPU polling interval for file-change checks.
+        # Keep the existing low-CPU idle input timeout.
         self.assertEqual(screen.timeout.call_args_list,
                          [call(100), call(-1), call(100), call(-1)])
 

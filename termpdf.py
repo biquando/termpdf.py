@@ -78,6 +78,12 @@ from collections import deque, namedtuple
 from math import ceil
 from bisect import bisect_left, bisect_right
 from tempfile import NamedTemporaryFile
+from watchdog.events import FileModifiedEvent, FileSystemEventHandler
+if sys.platform == 'darwin':
+    # FSEvents can batch notifications; kqueue wakes on the write itself.
+    from watchdog.observers.api import BaseObserver, EventEmitter
+else:
+    from watchdog.observers import Observer as FileObserver
 
 
 # Class Definitions
@@ -86,7 +92,227 @@ KeyEvent = namedtuple('KeyEvent', 'key code event_type modifiers')
 KEY_EVENT = -2
 FOCUS_OUT = -3
 SCROLL = -4
+FILE_CHANGED = -5
 ScrollEvent = namedtuple('ScrollEvent', 'dx dy')
+
+class FileChangeSignal(threading.Event):
+    """A coalescing event that can also wake select() through a pipe."""
+    def __init__(self):
+        super().__init__()
+        self.read_fd, self.write_fd = os.pipe()
+        os.set_blocking(self.read_fd, False)
+        os.set_blocking(self.write_fd, False)
+        self._signal_lock = threading.Lock()
+        self.closed = False
+
+    def fileno(self):
+        return self.read_fd
+
+    def set(self):
+        with self._signal_lock:
+            if self.closed or self.is_set():
+                return
+            super().set()
+            try:
+                os.write(self.write_fd, b'\0')
+            except BlockingIOError:
+                pass
+
+    def clear(self):
+        with self._signal_lock:
+            super().clear()
+            if self.closed:
+                return
+            while True:
+                try:
+                    if not os.read(self.read_fd, 4096):
+                        break
+                except BlockingIOError:
+                    break
+
+    def close(self):
+        with self._signal_lock:
+            if not self.closed:
+                self.closed = True
+                os.close(self.read_fd)
+                os.close(self.write_fd)
+
+
+if sys.platform == 'darwin':
+    class TargetKqueueEmitter(EventEmitter):
+        """Watch one file and its parent, without opening sibling files."""
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._lock = threading.Lock()
+            self._shutdown_signal = FileChangeSignal()
+            self._kq = None
+            self._parent_fd = self._target_fd = None
+            self._target_identity = None
+            # watchdog 7 normalizes file watches to their parent directory.
+            # raw_path preserves the requested file; watchdog 6 uses path.
+            self._target_path = os.path.abspath(getattr(self.watch, 'raw_path', self.watch.path))
+            try:
+                self._kq = select.kqueue()
+                self._parent_fd = os.open(os.path.dirname(self._target_path), os.O_EVTONLY)
+                self._register(self._parent_fd)
+                self._arm_target()
+                self._kq.control([select.kevent(
+                    self._shutdown_signal.fileno(), filter=select.KQ_FILTER_READ,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR)], 0, 0)
+            except Exception:
+                self.on_thread_stop()
+                raise
+
+        def _register(self, descriptor):
+            self._kq.control([select.kevent(
+                descriptor, filter=select.KQ_FILTER_VNODE,
+                flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                fflags=(select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND |
+                        select.KQ_NOTE_ATTRIB | select.KQ_NOTE_DELETE |
+                        select.KQ_NOTE_RENAME | select.KQ_NOTE_REVOKE))], 0, 0)
+
+        def _arm_target(self):
+            signature = FileChangeWatcher.signature(self._target_path)
+            identity = signature[:2] if signature else None
+            if self._target_identity == identity:
+                return
+            if self._target_fd is not None:
+                os.close(self._target_fd)
+                self._target_fd = None
+                self._target_identity = None
+            if signature is None:
+                return
+            try:
+                descriptor = os.open(self._target_path, os.O_EVTONLY)
+            except (FileNotFoundError, NotADirectoryError, PermissionError):
+                # The parent watch detects the target reappearing.
+                return
+            try:
+                self._register(descriptor)
+                info = os.fstat(descriptor)
+            except Exception:
+                os.close(descriptor)
+                raise
+            self._target_fd = descriptor
+            self._target_identity = info.st_dev, info.st_ino
+
+        def _read_events(self, timeout):
+            events = self._kq.control(None, 16, timeout)
+            return [event for event in events
+                    if not (event.filter == select.KQ_FILTER_READ
+                            and event.ident == self._shutdown_signal.fileno())]
+
+        def queue_events(self, timeout):
+            with self._lock:
+                if not self.should_keep_running():
+                    return
+                events = self._read_events(timeout)
+                if events and self.should_keep_running():
+                    # A directory event can mean the file was atomically
+                    # replaced. Follow its new inode before the next wait.
+                    self._arm_target()
+                    self.queue_event(FileModifiedEvent(self._target_path))
+
+        def on_thread_stop(self):
+            # Wake the native wait before acquiring the lock used by it.
+            self._shutdown_signal.set()
+            with self._lock:
+                for name in ('_target_fd', '_parent_fd'):
+                    descriptor = getattr(self, name)
+                    if descriptor is not None:
+                        os.close(descriptor)
+                        setattr(self, name, None)
+                if self._kq is not None:
+                    self._kq.close()
+                self._shutdown_signal.close()
+
+    class FileObserver(BaseObserver):
+        def __init__(self, *, timeout=1.0):
+            super().__init__(TargetKqueueEmitter, timeout=timeout)
+
+
+class FileChangeWatcher(FileChangeSignal, FileSystemEventHandler):
+    def __init__(self, path):
+        super().__init__()
+        self._observer = FileObserver()
+        self._watches = {}
+        self._path = None
+        self._resolved_path = None
+        self._event_paths = set()
+        self._path_lock = threading.Lock()
+        try:
+            self.watch(path)
+        except Exception:
+            self.close()
+            raise
+
+    @staticmethod
+    def signature(path):
+        try:
+            info = os.stat(path)
+            return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+        except OSError:
+            return None
+
+    def watch(self, path):
+        path = os.path.abspath(path)
+        resolved = os.path.realpath(path)
+        targets = {path, resolved}
+        # macOS monitors a target plus its parent in one emitter. Other
+        # backends monitor directories, including both ends of a symlink.
+        watch_paths = {target if sys.platform == 'darwin' else os.path.dirname(target)
+                       for target in targets if os.path.isdir(os.path.dirname(target))}
+        with self._path_lock:
+            if (path == self._path and resolved == self._resolved_path
+                    and watch_paths == self._watches.keys()):
+                return
+            if path != self._path:
+                self._signature = self.signature(path)
+                self.clear()
+            self._path = path
+            self._resolved_path = resolved
+            self._event_paths = targets | {os.path.dirname(target) for target in targets}
+        # Do not hold _path_lock while calling the observer: its dispatcher
+        # invokes callbacks while holding the observer's own lock.
+        for target in watch_paths - self._watches.keys():
+            self._watches[target] = self._observer.schedule(self, target, recursive=False)
+        for target in self._watches.keys() - watch_paths:
+            self._observer.unschedule(self._watches.pop(target))
+        self._check_for_change()
+
+    def on_any_event(self, event):
+        if event.event_type not in ('modified', 'created', 'moved', 'deleted'):
+            return
+        paths = {os.path.abspath(os.fsdecode(path)) for path in
+                 (event.src_path, event.dest_path) if path}
+        self._check_for_change(paths)
+
+    def _check_for_change(self, paths=None):
+        with self._path_lock:
+            # Some backends report an atomic replacement only as a parent
+            # directory change. Recheck the target's signature in that case.
+            if paths is not None and self._event_paths.isdisjoint(paths):
+                return
+            signature = self.signature(self._path)
+            # Wait for a removed file to reappear, and ignore duplicate native
+            # notifications for the same saved contents without adding a delay.
+            if ((signature is not None and signature != self._signature)
+                    or os.path.realpath(self._path) != self._resolved_path):
+                self._signature = signature
+                self.set()
+
+    def start(self):
+        self._observer.start()
+        # Include saves made while the native watch was being registered.
+        self._check_for_change()
+
+    def close(self):
+        if self.closed:
+            return
+        self._observer.stop()
+        if self._observer.is_alive():
+            self._observer.join()
+        super().close()
 
 class Config:
     def __init__(self):
@@ -167,6 +393,7 @@ class Screen:
         self.last_key_event = None
         self.key_sequence = bytearray()
         self.input_timeout = -1
+        self.file_change = None
 
     def timeout(self, milliseconds):
         self.input_timeout = milliseconds
@@ -247,8 +474,12 @@ class Screen:
         return win, pad
 
     def raw_key(self, continuation=False):
+        if isinstance(self.file_change, FileChangeSignal) and self.file_change.is_set():
+            return FILE_CHANGED
         if self.pending_keys:
             return self.pending_keys.popleft()
+        if isinstance(self.file_change, FileChangeSignal):
+            return self.wait_for_key(25 if continuation else self.input_timeout)
         if continuation:
             self.stdscr.timeout(25)
             try:
@@ -256,6 +487,34 @@ class Screen:
             finally:
                 self.stdscr.timeout(self.input_timeout)
         return self.stdscr.getch()
+
+    def wait_for_key(self, milliseconds):
+        deadline = monotonic() + milliseconds / 1000 if milliseconds >= 0 else None
+        self.stdscr.timeout(0)
+        try:
+            while True:
+                if self.file_change.is_set():
+                    return FILE_CHANGED
+                # Curses can already have keys or KEY_RESIZE buffered even
+                # when the terminal fd is not readable, so check it first.
+                key = self.stdscr.getch()
+                if key != -1:
+                    if self.file_change.is_set():
+                        self.pending_keys.appendleft(key)
+                        return FILE_CHANGED
+                    return key
+                remaining = None if deadline is None else max(0, deadline - monotonic())
+                if remaining == 0:
+                    return -1
+                # Also give curses a chance to process SIGWINCH when a modal
+                # dialog is using an otherwise unlimited input timeout.
+                wait = .1 if remaining is None else min(.1, remaining)
+                try:
+                    select.select([sys.stdin.fileno(), self.file_change.fileno()], [], [], wait)
+                except InterruptedError:
+                    continue
+        finally:
+            self.stdscr.timeout(self.input_timeout)
 
     def decode_key(self, sequence):
         if sequence.startswith(b'\033[<') and sequence[-1:] in (b'M', b'm'):
@@ -353,7 +612,7 @@ class Screen:
             key = self.getch()
             if key == 10:
                 return ''.join(text).encode('utf-8')
-            if key == 27:
+            if key in (27, FILE_CHANGED):
                 return b''
             if key == curses.KEY_RESIZE:
                 self.pending_keys.appendleft(key)
@@ -1050,7 +1309,7 @@ class Document(fitz.Document):
                 win,pad,y,x,h,w,span = init_pad(toc)
             elif key in keys.QUIT:
                 clean_exit()
-            elif key == 27 or key in keys.SHOW_TOC:
+            elif key in (27, FILE_CHANGED) or key in keys.SHOW_TOC:
                 scr.clear()
                 return
             elif key in keys.NEXT_PAGE:
@@ -1151,7 +1410,7 @@ class Document(fitz.Document):
                 win,pad,y,x,h,w,span = init_pad(meta)
             elif key in keys.QUIT:
                 clean_exit()
-            elif key == 27 or key in keys.SHOW_META:
+            elif key in (27, FILE_CHANGED) or key in keys.SHOW_META:
                 scr.clear()
                 return
             elif key in keys.NEXT_PAGE:
@@ -1253,7 +1512,7 @@ class Document(fitz.Document):
                 win,pad,y,x,h,w,span = init_pad(urls)
             elif key in keys.QUIT:
                 clean_exit()
-            elif key == 27 or key in keys.SHOW_LINKS:
+            elif key in (27, FILE_CHANGED) or key in keys.SHOW_LINKS:
                 scr.clear()
                 return
             elif key in keys.NEXT_PAGE:
@@ -1426,16 +1685,37 @@ def write_gr_cmd_with_response(cmd, payload=None):
 
 
 def write_chunked(cmd, data):
-    if cmd['f'] != 100:
-        data = zlib.compress(data)
-        cmd['o'] = 'z'
-    data = standard_b64encode(data)
-    while data:
-        chunk, data = data[:4096], data[4096:]
-        m = 1 if data else 0
-        cmd['m'] = m
-        write_gr_cmd(cmd, chunk)
-        cmd.clear()
+    header = dict(cmd)
+    header.pop('o', None)
+    if header['f'] != 100:
+        # Sample across the image, rather than only its often-blank top edge.
+        # Noisy images rarely repay the cost of compressing the entire buffer.
+        block = 16384
+        if len(data) <= block * 4:
+            compressed = zlib.compress(data, 1)
+        else:
+            last = len(data) - block
+            sample = b''.join(data[offset:offset + block]
+                              for offset in (0, last // 3, 2 * last // 3, last))
+            compressed = (zlib.compress(data, 1)
+                          if len(zlib.compress(sample, 1)) < len(sample) * .9 else None)
+        if compressed is not None and len(compressed) < len(data):
+            data = compressed
+            header['o'] = 'z'
+
+    encoded = memoryview(standard_b64encode(data))
+    pending = bytearray()
+    for offset in range(0, len(encoded), 4096):
+        header['m'] = int(offset + 4096 < len(encoded))
+        pending.extend(serialize_gr_command(header, encoded[offset:offset + 4096]))
+        # Batch small protocol chunks without retaining another full image.
+        if len(pending) >= 65536:
+            sys.stdout.buffer.write(pending)
+            pending.clear()
+        header = {}
+    if pending:
+        sys.stdout.buffer.write(pending)
+    sys.stdout.flush()
 
 # bibtex functions
 
@@ -1598,7 +1878,10 @@ def clean_exit(message=''):
 
     for doc in bufs.docs:
         # save current state
-        doc.write_state()
+        try:
+            doc.write_state()
+        except OSError:
+            logging.debug('Cannot save state while document is unavailable', exc_info=True)
         # close the document
         doc.close()
 
@@ -1794,7 +2077,7 @@ def visual_mode(doc,bar):
         elif key in keys.QUIT:
             clean_exit()
 
-        elif key == 27 or key in keys.VISUAL_MODE:
+        elif key in (27, FILE_CHANGED) or key in keys.VISUAL_MODE:
             unhighlight_selection([t,b])
             return
 
@@ -1903,21 +2186,39 @@ def visual_mode(doc,bar):
             doc.mark_all_pages_stale()
             return
 
-def watch_for_file_change(file_change,path):
-    timestamp = os.path.getmtime(path)
-    while True:
-        sleep(.5)
-        nts = os.path.getmtime(path)
-        if nts != timestamp:
-            timestamp = nts
-            logging.debug('file changed')
-            file_change.set() 
-
 def view(file_change,doc):
+    scr.file_change = file_change if isinstance(file_change, FileChangeSignal) else None
     try:
         _view(file_change, doc)
     finally:
+        scr.file_change = None
         scr.disable_keyboard()
+        if isinstance(file_change, FileChangeWatcher):
+            file_change.close()
+
+def reload_document(current_doc):
+    """Prepare a replacement fully before the viewer gives up its document."""
+    signature = FileChangeWatcher.signature(current_doc.filename)
+    current_doc.write_state()
+    replacement = Document(current_doc.filename)
+    try:
+        cachefile = get_cachefile(replacement.filename)
+        if os.path.exists(cachefile):
+            with open(cachefile, 'r') as stream:
+                state = json.load(stream)
+            for key in state:
+                setattr(replacement, key, state[key])
+        if not replacement.citekey:
+            replacement.citekey = citekey_from_path(replacement.filename)
+        replacement.pages_to_logical_pages()
+        replacement.goto_logical_page(replacement.logicalpage)
+        replacement.set_layout(replacement.papersize, adjustpage=False)
+        if FileChangeWatcher.signature(current_doc.filename) != signature:
+            raise OSError('Document changed while reloading')
+    except Exception:
+        replacement.close()
+        raise
+    return replacement
 
 def _view(file_change,doc):
 
@@ -1939,17 +2240,29 @@ def _view(file_change,doc):
     pan_animation = PanAnimation()
     held_pan = HeldPan()
     last_draw = 0
+    retry_doc = None
+    retry_at = 0
+    retry_delay = .1
 
     while True:
 
+        if isinstance(file_change, FileChangeWatcher):
+            file_change.watch(doc.filename)
+        if retry_doc is not doc:
+            retry_doc = None
+            retry_delay = .1
         pan_animation.advance(doc)
         held_pan.advance(doc)
         moving = pan_animation.active or held_pan.active
-        if not moving or monotonic() - last_draw >= pan_animation.frame_interval:
-            bar.cmd = ''.join(map(chr,stack[::-1]))
-            bar.update(doc)
-            doc.display_page(bar,doc.page)
-            last_draw = monotonic()
+        frame_started = monotonic()
+        if not file_change.is_set() and (not moving or frame_started - last_draw >= pan_animation.frame_interval):
+            # Rendering time counts toward the frame interval, rather than
+            # being followed by another complete interval of waiting.
+            last_draw = frame_started
+            if retry_doc is not doc:
+                bar.cmd = ''.join(map(chr,stack[::-1]))
+                bar.update(doc)
+                doc.display_page(bar,doc.page)
 
         if count_string == "":
             count = 1
@@ -1958,13 +2271,13 @@ def _view(file_change,doc):
         
         if moving:
             remaining = pan_animation.frame_interval - (monotonic() - last_draw)
-            scr.timeout(max(1, ceil(remaining * 1000)))
+            scr.timeout(max(0, ceil(remaining * 1000)))
         else:
             scr.timeout(100)
 
         key = scr.getch()
         while key == -1 and not file_change.is_set():
-            if moving:
+            if moving or (retry_doc is doc and monotonic() >= retry_at):
                 break
             key = scr.getch()
         scr.timeout(-1)
@@ -1981,6 +2294,9 @@ def _view(file_change,doc):
             logging.debug('view thread sees that file has changed')
             key = keys.REFRESH[0]
             file_change.clear()
+            retry_delay = .1
+        elif key == -1 and retry_doc is doc and monotonic() >= retry_at:
+            key = keys.REFRESH[0]
 
         if key in map(ord, 'HJKL'):
             key = KEY_EVENT
@@ -1996,24 +2312,26 @@ def _view(file_change,doc):
             resize_viewer()
 
         elif key in keys.REFRESH:
-            scr.clear()
-            scr.get_size()
-            scr.init_curses()
             current_doc = bufs.docs[bufs.current]
-            current_doc.write_state()
-            doc = Document(current_doc.filename)
-            cachefile = get_cachefile(doc.filename)
-            if os.path.exists(cachefile):
-                with open(cachefile, 'r') as f:
-                    state = json.load(f)
-                for key in state:
-                    setattr(doc, key, state[key])
-            bufs.docs[bufs.current] = doc
-            if not doc.citekey:
-                doc.citekey = citekey_from_path(doc.filename)
-            doc.pages_to_logical_pages()
-            doc.goto_logical_page(doc.logicalpage)
-            doc.set_layout(doc.papersize,adjustpage=False)
+            try:
+                replacement = reload_document(current_doc)
+            except (OSError, RuntimeError, ValueError):
+                logging.debug('Document is not ready to reload', exc_info=True)
+                bar.message = 'Waiting for document to finish saving'
+                bar.update(current_doc)
+                retry_doc = current_doc
+                retry_at = monotonic() + retry_delay
+                retry_delay = min(1, retry_delay * 2)
+            else:
+                scr.clear()
+                scr.get_size()
+                scr.init_curses()
+                doc = replacement
+                bufs.docs[bufs.current] = doc
+                retry_doc = None
+                retry_delay = .1
+                bar.message = doc.citekey or ''
+                current_doc.close()
 
         elif key == 27:
             count_string = ""
@@ -2319,14 +2637,14 @@ def main(args=sys.argv):
     # apply layout settings
     doc.set_layout(doc.papersize,adjustpage=False)
 
-    # set up thread to watch for file changes
-    file_change = threading.Event()
-    file_watch = threading.Thread(target=watch_for_file_change, args=(file_change, doc.filename))
-    file_watch.daemon = True
-    file_watch.start()
-
-    doc_viewer = threading.Thread(target=view, args=(file_change, doc))
-    doc_viewer.start()
+    file_change = FileChangeWatcher(doc.filename)
+    try:
+        file_change.start()
+        doc_viewer = threading.Thread(target=view, args=(file_change, doc))
+        doc_viewer.start()
+    except Exception:
+        file_change.close()
+        raise
 
 if __name__ == '__main__':
     #logging.basicConfig(filename='termpdf.log',level=logging.DEBUG)

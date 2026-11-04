@@ -5,4 +5,5 @@ pybtex
 pynvim
 roman
 pagelabels
+watchdog>=6
 
