@@ -45,6 +45,13 @@ class ReloadDocumentTests(unittest.TestCase):
             termpdf.reload_document(self.doc)
         self.assertFalse(self.doc.is_closed)
 
+    def test_reload_without_a_citekey_or_configured_bibliography(self):
+        self.doc.citekey = None
+        with patch.object(termpdf.config, 'BIBTEX', ''):
+            with termpdf.reload_document(self.doc) as replacement:
+                self.assertEqual(replacement.page_count, 1)
+                self.assertIsNone(replacement.citekey)
+
     def test_failed_preparation_closes_candidate_and_keeps_current_document(self):
         candidate = Mock(filename=str(self.path))
         candidate.set_layout.side_effect = RuntimeError('save is incomplete')

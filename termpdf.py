@@ -56,7 +56,7 @@ import re
 import array
 import curses
 import fcntl
-import fitz
+import pymupdf as fitz
 import os
 import sys
 import logging
@@ -1720,6 +1720,9 @@ def write_chunked(cmd, data):
 # bibtex functions
 
 def bib_from_field(field,regex):
+
+    if not config.BIBTEX:
+        return None
 
     if shutil.which('bibtool') is not None:
         from pybtex.database import parse_string 
