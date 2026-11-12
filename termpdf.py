@@ -238,6 +238,7 @@ class FileChangeWatcher(FileChangeSignal, FileSystemEventHandler):
         self._watches = {}
         self._path = None
         self._resolved_path = None
+        self._observed_path = None
         self._event_paths = set()
         self._path_lock = threading.Lock()
         try:
@@ -267,7 +268,8 @@ class FileChangeWatcher(FileChangeSignal, FileSystemEventHandler):
                     and watch_paths == self._watches.keys()):
                 return
             if path != self._path:
-                self._signature = self.signature(path)
+                self._signature = self.signature(resolved)
+                self._observed_path = resolved
                 self.clear()
             self._path = path
             self._resolved_path = resolved
@@ -293,12 +295,17 @@ class FileChangeWatcher(FileChangeSignal, FileSystemEventHandler):
             # directory change. Recheck the target's signature in that case.
             if paths is not None and self._event_paths.isdisjoint(paths):
                 return
-            signature = self.signature(self._path)
+            resolved = os.path.realpath(self._path)
+            # Stat the resolved target so a concurrent retarget cannot pair
+            # the old target's metadata with the new target's path.
+            signature = self.signature(resolved)
             # Wait for a removed file to reappear, and ignore duplicate native
             # notifications for the same saved contents without adding a delay.
             if ((signature is not None and signature != self._signature)
-                    or os.path.realpath(self._path) != self._resolved_path):
+                    or resolved != self._observed_path):
                 self._signature = signature
+                # Record retargets before the viewer updates native watches.
+                self._observed_path = resolved
                 self.set()
 
     def start(self):

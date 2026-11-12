@@ -153,6 +153,76 @@ class FileChangeInputTests(unittest.TestCase):
         self.assertFalse(self.signal.is_set())
 
 
+class FileChangeWatcherTests(unittest.TestCase):
+    def test_retarget_during_stat_does_not_mix_old_metadata_with_new_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            first, second, link = (directory / name for name in
+                                   ('first.pdf', 'second.pdf', 'document.pdf'))
+            first.write_bytes(b'first')
+            second.write_bytes(b'second')
+            link.symlink_to(first)
+            with patch.object(termpdf, 'FileObserver', return_value=Mock()):
+                watcher = termpdf.FileChangeWatcher(link)
+            try:
+                signature = watcher.signature
+
+                def retarget_during_stat(path):
+                    snapshot = signature(path)
+                    replacement = directory / 'new-link'
+                    replacement.symlink_to(second)
+                    os.replace(replacement, link)
+                    return snapshot
+
+                with patch.object(watcher, 'signature', side_effect=retarget_during_stat):
+                    watcher.on_any_event(termpdf.FileModifiedEvent(str(directory)))
+                notifications = int(watcher.is_set())
+                watcher.clear()
+                watcher.on_any_event(termpdf.FileModifiedEvent(str(link)))
+                notifications += int(watcher.is_set())
+                self.assertEqual(notifications, 1)
+            finally:
+                watcher.close()
+
+    def test_symlink_retarget_is_reported_once_before_watch_is_updated(self):
+        for same_inode in (False, True):
+            with self.subTest(same_inode=same_inode), \
+                    tempfile.TemporaryDirectory() as directory:
+                directory = Path(directory)
+                first = directory / 'first' / 'real.pdf'
+                second = directory / 'second' / 'real.pdf'
+                first.parent.mkdir()
+                second.parent.mkdir()
+                first.write_bytes(b'original')
+                if same_inode:
+                    os.link(first, second)
+                else:
+                    second.write_bytes(b'new target')
+                link = directory / 'document.pdf'
+                link.symlink_to(first)
+                with patch.object(termpdf, 'FileObserver', return_value=Mock()):
+                    watcher = termpdf.FileChangeWatcher(link)
+                try:
+                    replacement = directory / 'new-link'
+                    replacement.symlink_to(second)
+                    os.replace(replacement, link)
+                    watcher.on_any_event(termpdf.FileModifiedEvent(str(link)))
+                    self.assertTrue(watcher.is_set())
+                    watcher.clear()
+
+                    for path in (link, directory, first, first.parent):
+                        watcher.on_any_event(termpdf.FileModifiedEvent(str(path)))
+                        self.assertFalse(watcher.is_set(), 'duplicate symlink notification')
+
+                    watcher.watch(link)
+                    self.assertFalse(watcher.is_set())
+                    second.write_bytes(b'new target saved')
+                    watcher.on_any_event(termpdf.FileModifiedEvent(str(second)))
+                    self.assertTrue(watcher.is_set())
+                finally:
+                    watcher.close()
+
+
 class NativeFileWatchTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -257,7 +327,11 @@ class NativeFileWatchTests(unittest.TestCase):
         os.replace(link, self.path)
         self.assert_changed()
         self.watcher.watch(self.path)
-        targets[1].write_bytes(b'new target saved')
+        # Publish one complete save so an in-place truncate/write cannot
+        # leave a second valid notification pending for the final assertion.
+        replacement = targets[1].with_name('replacement.pdf')
+        replacement.write_bytes(b'new target saved')
+        os.replace(replacement, targets[1])
         self.assert_changed()
         targets[0].write_bytes(b'old target saved')
         self.assertFalse(self.watcher.wait(.15))
